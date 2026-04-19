@@ -1,0 +1,90 @@
+dir_list:
+  home: "/home/kimjona/Health-Privacy-Challenge/"
+  meta: "data/meta"
+  processed_data: "data/processed"
+  data_save_dir: "data_splits"
+  split_save_dir: "data_splits/split_indices"
+  model_save_dir: "models"
+
+dataset_config:
+  name: "TCGA-BRCA"
+  count_file: "data/processed/TCGA-BRCA_primary_tumor_star_deseq_VST_lmgenes.tsv"
+  annot_file: "data/meta/TCGA-BRCA_primary_tumor_subtypes.csv" 
+  split_file: "data/TCGA-BRCA_splits.yaml"
+  sample_col_name: "samplesID" 
+  subtype_col_name: "cancer_type" 
+  num_splits: 30
+  random_seed: 42
+
+generator_name: "embedded_diffusion"
+train: True
+generate: True
+load_from_checkpoint: False
+
+embedded_diffusion_config:
+  device: "cuda:0"
+
+  # Noise schedule
+  num_timesteps: 1000
+  beta_schedule: "linear"  # cosine, linear or power
+  cosine_s: 0.008
+  linear_beta_start: 0.001
+  linear_beta_end: 0.02
+  power_sigma_max: 1
+  power_sigma_min: 0.005
+  power_rho_expo: 7
+  
+  # Batch size and epochs
+  batch_size: 32
+  epochs: 200
+  
+  # Early stopping
+  early_stopping: true
+  early_stopping_patience: 30
+  early_stopping_min_delta: 0.0001
+
+  # Progressive dimensionality (dynamically builds structure based on num_res_blocks)
+  
+  # General architecture
+  hidden_dims: [2048, 2048]
+  input_dim: 978
+  num_classes: 5
+  
+  # GroupNorm 
+  num_groups: 8  # Maximum number of groups per Group Normalization
+  
+  # Regularization
+  dropout: 0.2
+  
+  # Embedding dimensions
+  time_embedding_dim: 128
+  label_embedding_dim: 64
+  
+  # Attention
+  attn_num_heads: 0 # 0 for no attention
+  attn_num_tokens: 64
+  
+  # Learning rate schedule
+  learning_rate: 0.001  
+  lr_weight_decay: 0.001
+  lr_pct_start: 0.2 # warmup
+  lr_div_factor: 25
+  lr_final_div_factor: 25
+  lr_anneal_strategy: "cos"
+  
+  # Differential privacy parameters
+  dp_noise_multiplier: 0.00001  # Amount of noise to add (0 no added noise)
+  max_grad_norm: 1.0  # Gradient clipping limit
+  
+  # Data normalization method ("standard" or "quantile")
+  norm_method: "quantile" 
+  
+  # Stratified sampling for imbalanced classes using SMOTE
+  stratified_sampling: True
+  smote_upsample_to: 3000
+  
+  # Post-processing for synthetic data
+  clip_outliers: False  # Clip extreme values in generated samples
+
+  # Logging with wandb (set to true if using wandb)
+  wandb: False

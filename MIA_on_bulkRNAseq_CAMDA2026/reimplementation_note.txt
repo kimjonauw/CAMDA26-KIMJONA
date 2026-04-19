@@ -1,0 +1,74 @@
+╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Plan to implement                                                                                                   │
+│                                                                                                                     │
+│ Plan: Train shadow models on real data subsets for principled MIA                                                   │
+│                                                                                                                     │
+│ Context                                                                                                             │
+│                                                                                                                     │
+│ The current pipeline trains shadow models on challenge synthetic data and uses the splits YAML membership labels    │
+│ for MLP training. But we don't know which split the target model used, so these labels may be wrong. The principled │
+│  fix: train shadow models on subsets of real data (using the 5 existing YAML splits), creating known in/out         │
+│ partitions. The MLP learns "what membership looks like" from these known ground truths. At challenge inference, a   │
+│ proxy model trained on challenge synthetic data extracts features, and the MLP classifies.                          │
+│                                                                                                                     │
+│ Pipeline overview                                                                                                   │
+│                                                                                                                     │
+│ 1. Train 5 shadow models on real data — for each YAML split, train a diffusion model on that split's ~871 training  │
+│ samples (known members). This gives us 5 models with known memberships.                                             │
+│ 2. Extract features — for each shadow model, extract loss-trajectory features for all 1089 real samples. Label with │
+│  that split's known membership.                                                                                     │
+│ 3. Train MLP — on features from splits 1-3, validate on 4-5 (same as before).                                       │
+│ 4. Challenge inference — train a "target proxy" model on challenge synthetic data, extract features for all real    │
+│ samples, apply MLP.                                                                                                 │
+│                                                                                                                     │
+│ Changes                                                                                                             │
+│                                                                                                                     │
+│ 1. mia/data_utils.py                                                                                                │
+│                                                                                                                     │
+│ - Add load_real_split(dataset_name, split_no) → returns X_train (np.ndarray of the ~871 member samples for that     │
+│ split). Uses load_real_data() + load_splits_yaml() to select only training-set rows.                                │
+│                                                                                                                     │
+│ 2. mia/shadow_model.py                                                                                              │
+│                                                                                                                     │
+│ - Refactor train_shadow_model(dataset_name, split_no, ...) to accept X_train (np.ndarray) directly instead of       │
+│ loading data itself. The caller decides what data to pass.                                                          │
+│ - Rename current function or add a wrapper. Simplest: train_shadow_model(X_train, save_path, split_no, device) —    │
+│ takes raw data, fits scaler, trains, saves checkpoint. Returns (model, diff_trainer, scaler).                       │
+│ - Add train_target_proxy(dataset_name, device) — loads challenge synthetic data, calls train_shadow_model with it,  │
+│ saves to a distinct path (e.g., shadow_models/{dataset}/target_proxy.pt).                                           │
+│                                                                                                                     │
+│ 3. mia/attack.py                                                                                                    │
+│                                                                                                                     │
+│ - step_train_shadows(): For each split, load real data training subset via load_real_split(), pass to               │
+│ train_shadow_model().                                                                                               │
+│ - step_extract_features(): For each split, load that split's shadow model, fit scaler on the same real data subset, │
+│  extract features, label with known membership from get_membership_labels().                                        │
+│ - step_train_classifier(): No change (already loads features from .npz files).                                      │
+│ - step_predict_challenge(): Train (or load) a target proxy model on challenge synthetic data. Fit scaler on         │
+│ challenge synthetic data. Extract features with dummy labels. Apply MLP.                                            │
+│ - _reconstruct_scaler(): Now needs to know what data was used — accept X_data directly, or have two variants (one   │
+│ for real splits, one for proxy).                                                                                    │
+│ - Remove _reconstruct_scaler() as a separate function — just fit the scaler inline since the data is already        │
+│ loaded.                                                                                                             │
+│                                                                                                                     │
+│ 4. mia/config.py                                                                                                    │
+│                                                                                                                     │
+│ - No changes needed (DUMMY_LABEL, UNCONDITIONAL_NUM_CLASSES already present).                                       │
+│                                                                                                                     │
+│ 5. mia/loss_features.py, mia/classifier.py                                                                          │
+│                                                                                                                     │
+│ - No changes needed.                                                                                                │
+│                                                                                                                     │
+│ Key files                                                                                                           │
+│                                                                                                                     │
+│ - mia/data_utils.py — add load_real_split()                                                                         │
+│ - mia/shadow_model.py — refactor to accept X_train directly, add train_target_proxy()                               │
+│ - mia/attack.py — rewire pipeline steps                                                                             │
+│                                                                                                                     │
+│ Verification                                                                                                        │
+│                                                                                                                     │
+│ - Run python -m mia.attack --dataset BRCA --device cuda:0                                                           │
+│ - Confirm: shadow models train on ~871 real samples per split                                                       │
+│ - Confirm: MLP trains on known ground-truth membership                                                              │
+│ - Confirm: challenge predictions use a proxy trained on challenge synthetic data                                    │
+╰───────────────────────────────────────────────────────────────────────────────────────────────────────────────────

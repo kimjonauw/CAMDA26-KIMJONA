@@ -1,0 +1,33 @@
+❯ do you have any recomendations for architecture / hyperparameter changes in the attack MLP, based       
+  on the differences in our data domains? bulk RNA-seq data is very different from the 10-feature        
+  transaction tabular data from MIDST                                                                     
+                                                                                                          
+● Yes, there are some important differences that suggest changes. The key issue:                          
+                                                            
+  The MLP training set is ~50x smaller than MIDST's.                                                      
+   
+  - MIDST: 30 shadow models × 6,000 samples each = ~180k MLP training pairs                               
+  - Ours: 5 shadows × 1,089 samples = ~5,445 pairs (only ~3,267 in train splits 1-3)
+
+  Yet we're feeding the MLP the same 2100-dim input with the same capacity (200-dim hidden layers). That's
+   heavily overparameterized for ~3k samples.
+
+  The other key difference: each MSE loss averages over 978 dimensions (genes) vs 10 (transaction
+  features). By law of large numbers, our individual loss values are much more stable across noise draws —
+   meaning the 300 noise vectors carry more redundant information.
+
+  Concrete recommendations, roughly ordered by what I'd try first:
+
+  1. Aggregate features before the MLP — instead of 2100 raw losses, compute per-timestep summary stats
+  (mean, std, min, max across 300 noises) → 7×4 = 28 features. Dramatically reduces overfitting risk and
+  may not lose much signal given the loss stability.
+  2. Reduce MLP capacity — hidden_dim 64 or 128 instead of 200, and add dropout (0.3-0.5) between layers.
+  3. Add weight decay — the optimizer is bare Adam right now; adding weight_decay=1e-3 or 1e-4 is free
+  regularization.
+  4. Reduce noise count — try N_NOISE=50 or 100. With 978-dim MSE, you get diminishing returns beyond
+  that. Also speeds up the expensive feature extraction step.
+  5. More/different timesteps — the memorization signal is typically strongest at low t (where the model
+  tries to reconstruct near the original). Could try denser sampling at the low end: [1, 2, 5, 10, 20, 50,
+   100, 200].
+  6. Now that you have 15 custom splits — that helps a lot (15 × 1,089 ≈ 16k pairs, 10 for train). But the
+   aggregated-features approach would still help.

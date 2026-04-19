@@ -1,0 +1,110 @@
+
+  ---
+  The Attack: A Complete Map of All Pieces
+
+  The Setting
+
+  You're on the Red Team in the CAMDA 2026 Health Privacy Challenge. Someone (the Blue Team / NoisyDiffusion)
+  trained an EmbeddedDiffusion model on some subset of 1,089 real TCGA-BRCA RNA-seq samples and released synthetic
+   data. You don't have access to the target model. Your job: figure out which real samples were in the training
+  set.
+
+  The Pieces
+
+  Piece: Target real data
+  What it is: 1,089 TCGA-BRCA samples (978 genes)
+  Where it lives: data/CAMDA26/RED_TCGA-BRCA/*.tsv
+  ────────────────────────────────────────
+  Piece: Target synthetic data
+  What it is: Synthetic CSV released by the challenge
+  Where it lives: data/CAMDA26/RED_TCGA-BRCA/synthetic_data_1.csv
+  ────────────────────────────────────────
+  Piece: 5 shadow synthetic datasets
+  What it is: Labeled synth data from NoisyDiffusion (your Blue Team work)
+  Where it lives: CAMDA25_NoisyDiffusion/TCGA-BRCA/synthetic_data/
+  ────────────────────────────────────────
+  Piece: splits.yaml
+  What it is: Ground-truth 5-fold CV: which real samples trained each of the 5 shadow models
+  Where it lives: CAMDA25_NoisyDiffusion/TCGA-BRCA/TCGA-BRCA_splits.yaml
+  ────────────────────────────────────────
+  Piece: Target model
+  What it is: The challenge diffusion model — you don't have it
+  Where it lives: Unknown / black-box
+  ────────────────────────────────────────
+  Piece: EmbeddedDiffusion architecture
+  What it is: The model code (same arch as target)
+  Where it lives: CAMDA25_NoisyDiffusion/TCGA-BRCA/model.py
+
+  How Each Piece Is Used, Stage by Stage
+
+  Stage 1: Train Shadow Models (you know the ground truth here)
+
+  Used: splits.yaml + target real data + model architecture
+
+  For each of 5 folds in splits.yaml:
+  - Take the train_index (~871 real samples) — these are known members
+  - The test_index (~218 real samples) — these are known non-members
+  - Train an EmbeddedDiffusion model on just the training subset (unconditional, dummy label=0)
+  - You now have 5 shadow models where you know exactly who was in/out
+
+  The 5 shadow synthetic datasets and their labels are not used for shadow training (the shadows are trained on
+  real data subsets). The synthetic datasets could be used for label prediction via KNN, but since training is
+  unconditional, this doesn't matter in practice.
+
+  Stage 2: Extract Loss-Trajectory Features
+
+  Used: 5 shadow models + all 1,089 real samples + splits.yaml (for ground-truth labels)
+
+  For each shadow model:
+  - Run all 1,089 real samples through it
+  - For each sample, compute denoising loss at 7 timesteps × 300 random noises = 2,100 features
+  - The key signal: samples the shadow was trained on yield lower loss (the model recognizes them); non-members
+  yield higher loss
+  - Tag each sample with its ground-truth membership label from splits.yaml
+
+  Output: 5 feature files, each (1089 × 2100) with binary membership labels.
+
+  Stage 3: Train the Meta-Classifier (MLP)
+
+  Used: feature files from stage 2 (splits 1-3 for train, 4-5 for val)
+
+  - Concatenate features from splits 1-3 → ~3,267 labeled examples
+  - Train a 3-layer MLP (2100 → 200 → 200 → 1) to predict member vs. non-member
+  - Best checkpoint selected by TPR @ 10% FPR (the challenge metric)
+  - Result: ~58% TPR at 10% FPR on validation
+
+  Stage 4: Challenge Inference (the actual attack)
+
+  Used: target synthetic data + all 1,089 real samples + trained MLP
+
+  Since you don't have the target model, you build a proxy:
+  1. Train a target proxy EmbeddedDiffusion on the challenge synthetic data (your best guess at what the target
+  model "saw")
+  2. Extract 2,100-dim loss features for all 1,089 real samples using this proxy
+  3. Feed features through the trained MLP → membership probability per sample
+  4. Output: synthetic_data_1_predictions.csv with (sample_id, score)
+
+  The Key Insight (adapted from MIDST)
+
+  The original MIDST approach used two models — one trained on auxiliary data, one on target synthetic data — and
+  compared their loss ratios with a hand-crafted activation function. Your adaptation is more principled: you
+  leverage the NoisyDiffusion splits to get ground-truth membership labels, train shadow models on real data with
+  known membership, and let an MLP learn the membership signal from 2,100-dimensional loss trajectories rather
+  than relying on a heuristic ratio.
+
+
+Other notes:
+
+  During MLP training (inside train_classifier, step 3): validation is computed on concatenated splits 4-5 as one pool (~2,178 samples). It's used epoch-by-epoch to
+  pick the best checkpoint by TPR@10%FPR. This is the standard train/val loop.
+
+  Per-split evaluation (lines 208-219, between steps 3 and 4): takes the already-trained best MLP and evaluates it on each split individually — all 5 of them,
+  including the 3 training splits. Each split's features come from a different shadow model, so the membership labels are different per split. This tells you:
+
+  - Splits 1-3: How well the MLP performs on the data it was trained on (sanity check / overfitting diagnostic)
+  - Splits 4-5: Per-split breakdown of the validation performance (the training loop only reported the pooled val metric — this shows if one split is harder than
+  another)
+
+  So the validation during training is "pooled val loss to pick a checkpoint," while the per-split evaluation is "post-hoc diagnostic showing performance broken down
+   by each shadow model independently." The split-2 result (0.71) vs split-3 (0.50) spread, for example, reveals that some shadow models produce more discriminative
+  features than others.

@@ -1,0 +1,78 @@
+---                                                                                                     
+  The Big Picture                                                                                         
+                                                                                                          
+  This is a membership inference attack (MIA) against a diffusion model called NoisyDiffusion that was    
+  trained on real patient RNA-seq data. The goal: given a sample, determine whether it was in the
+  diffusion model's training set or not.                                                                  
+
+  The core intuition: a diffusion model will denoise its own training data better than data it hasn't
+  seen. Samples it was trained on will have lower reconstruction loss.
+
+  ---
+  Step 1: Train Shadow Models (shadow_model.py)
+
+  You don't have direct access to the target model's weights, so you train shadow models — replicas that
+  mimic the target's architecture and training procedure.
+
+  - Load labeled synthetic data from the NoisyDiffusion repo (data the target model generated, with class
+  labels like BRCA.Basal, BRCA.LumA, etc.)
+  - Upsample with SMOTE to 3000 samples per class
+  - Normalize with QuantileTransformer
+  - Train an EmbeddedDiffusion model (same architecture/hyperparams as the target) using the diffusion
+  training objective: predict the noise ε that was added to a sample at timestep t
+  - 5 shadow models are trained, one per cross-validation split
+
+  Step 2: Extract Loss Features (loss_features.py)
+
+  This is the key signal extraction. For each real patient sample x₀:
+
+  1. Draw 300 fixed noise vectors ε from N(0, I)
+  2. For each of 7 timesteps [5, 10, 20, 30, 40, 50, 100]:
+    - Forward-diffuse the sample: x_t = √(ᾱ_t) · x₀ + √(1 - ᾱ_t) · ε
+    - Ask the shadow model to predict the noise: ε_pred = model(x_t, t, label)
+    - Compute per-noise-vector MSE: loss = ‖ε_pred − ε‖²
+
+  This gives 300 × 7 = 2,100 loss values per sample — a "loss trajectory" fingerprint.
+
+  The intuition: if x₀ was a training sample, the model will predict ε more accurately (lower loss) across
+   timesteps, especially at low noise levels (small t). The pattern of losses across timesteps and noise
+  draws is distinctive.
+
+  Important detail: the real data has no subtype labels, so labels are inferred via KNN on the
+  NoisyDiffusion repo's labeled synthetic data (data_utils.py:122-129). The label is needed because the
+  diffusion model is class-conditional.
+
+  Step 3: Train an MLP Classifier (classifier.py)
+
+  A simple 3-layer MLP (2100 → 200 → 200 → 1, tanh activations, sigmoid output) is trained to map the
+  2,100-dimensional loss fingerprint to a membership probability:
+
+  - Training data: loss features from splits 1-3, with ground-truth membership labels (from the splits
+  YAML — which sample IDs were in train vs. test for each split)
+  - Validation: splits 4-5
+  - Trained with BCE loss for 750 epochs
+  - Best checkpoint saved by TPR @ 10% FPR (the challenge metric — how many true members can you catch
+  while only falsely accusing 10% of non-members)
+
+  Step 4: Predict on Challenge Data (attack.py:155-191)
+
+  Apply the full pipeline to the challenge's real samples:
+  - Shadow model extracts 2,100 loss features
+  - MLP outputs a membership score per sample
+  - Saved as synthetic_data_1_predictions.csv
+
+  ---
+  In summary
+
+  Real sample x₀
+      ↓
+  Add known noise ε at multiple timesteps t → x_t
+      ↓
+  Shadow model tries to predict ε from x_t → ε_pred
+      ↓
+  Compute ‖ε_pred − ε‖² for 300 noise draws × 7 timesteps = 2,100 features
+      ↓
+  MLP classifies: member or non-member?
+
+  The entire attack rests on the fact that diffusion models overfit slightly — they reconstruct (denoise)
+  their training data more faithfully than unseen data.

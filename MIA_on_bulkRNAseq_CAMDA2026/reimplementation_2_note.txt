@@ -1,0 +1,118 @@
+╭────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Plan to implement                                                                                      │
+│                                                                                                        │
+│ Plan: Custom Splits + Synthetic Validation for MIA Pipeline                                            │
+│                                                                                                        │
+│ Context                                                                                                │
+│                                                                                                        │
+│ The current MIA pipeline trains shadow diffusion models on real data subsets defined by                │
+│ NoisyDiffusion's 5-fold splits.yaml. At inference time, the target proxy is trained on synthetic data  │
+│ — creating a domain mismatch the MLP has never seen. We want to:                                       │
+│ 1. Decouple shadow splits from NoisyDiffusion by generating our own random N splits (configurable N,   │
+│ default 5)                                                                                             │
+│ 2. Add a synthetic-data validation step that trains models on the 5 NoisyDiffusion synthetic datasets  │
+│ and evaluates the MLP on them — directly measuring the real→synthetic domain gap                       │
+│ 3. Keep the original NoisyDiffusion-split strategy as a configurable option                            │
+│                                                                                                        │
+│ Files to Modify                                                                                        │
+│                                                                                                        │
+│ File: mia/config.py                                                                                    │
+│ Changes: Add SPLIT_MODE, NUM_CUSTOM_SPLITS, CUSTOM_SPLIT_RATIO, CUSTOM_SPLITS_DIR                      │
+│ ────────────────────────────────────────                                                               │
+│ File: mia/data_utils.py                                                                                │
+│ Changes: Add generate_custom_splits(), load_custom_splits(), modify load_real_split() and              │
+│   get_membership_labels() to dispatch on split mode                                                    │
+│ ────────────────────────────────────────                                                               │
+│ File: mia/attack.py                                                                                    │
+│ Changes: Add step_generate_splits(), step_validate_synthetic(), wire into run_full_pipeline()          │
+│ ────────────────────────────────────────                                                               │
+│ File: mia/shadow_model.py                                                                              │
+│ Changes: No changes needed — train_shadow_model() already accepts arbitrary X_train arrays             │
+│                                                                                                        │
+│ Detailed Changes                                                                                       │
+│                                                                                                        │
+│ 1. mia/config.py                                                                                       │
+│                                                                                                        │
+│ Add:                                                                                                   │
+│ # Split configuration                                                                                  │
+│ SPLIT_MODE = "custom"  # "custom" or "noisydiffusion"                                                  │
+│ NUM_CUSTOM_SPLITS = 5                                                                                  │
+│ CUSTOM_SPLIT_RATIO = 0.8  # fraction of real data used as "members" per split                          │
+│ CUSTOM_SPLITS_DIR = os.path.join(MIA_OUTPUT_DIR, "splits")                                             │
+│                                                                                                        │
+│ # Synthetic validation                                                                                 │
+│ SYNTH_VAL_MODEL_DIR = os.path.join(MIA_OUTPUT_DIR, "synth_val_models")                                 │
+│ SYNTH_VAL_FEATURES_DIR = os.path.join(MIA_OUTPUT_DIR, "synth_val_features")                            │
+│                                                                                                        │
+│ 2. mia/data_utils.py                                                                                   │
+│                                                                                                        │
+│ New function: generate_custom_splits(dataset_name, n_splits, ratio, seed)                              │
+│ - Load all real sample IDs via load_real_data()                                                        │
+│ - For each split i=1..n_splits: use np.random.RandomState(seed + i) to randomly assign 80% as members, │
+│  20% as non-members                                                                                    │
+│ - Save to CUSTOM_SPLITS_DIR/{dataset_name}/splits.json (a dict of {"split_1": {"train_ids": [...],     │
+│ "test_ids": [...]}, ...})                                                                              │
+│ - Idempotent: if file exists, skip (unless forced)                                                     │
+│                                                                                                        │
+│ New function: load_custom_splits(dataset_name)                                                         │
+│ - Load and return the saved splits.json                                                                │
+│                                                                                                        │
+│ Modify load_real_split(dataset_name, split_no)                                                         │
+│ - If SPLIT_MODE == "custom": load custom splits, return real data rows matching train_ids for that     │
+│ split                                                                                                  │
+│ - If SPLIT_MODE == "noisydiffusion": current behavior (use splits YAML)                                │
+│                                                                                                        │
+│ Modify get_membership_labels(dataset_name, split_no)                                                   │
+│ - Same dispatch: custom splits use saved train_ids/test_ids; noisydiffusion uses YAML test_index       │
+│                                                                                                        │
+│ 3. mia/attack.py                                                                                       │
+│                                                                                                        │
+│ New function: step_generate_splits(dataset_name)                                                       │
+│ - Called at the very start of run_full_pipeline() when SPLIT_MODE == "custom"                          │
+│ - Calls generate_custom_splits() to create and save the random splits                                  │
+│                                                                                                        │
+│ New function: step_validate_synthetic(dataset_name, device)                                            │
+│ - For each of 5 NoisyDiffusion splits:                                                                 │
+│   a. Load synthetic data: load_nd_synthetic(dataset_name, split_no) → X_syn                            │
+│   b. Train a diffusion model on X_syn (save to SYNTH_VAL_MODEL_DIR/{dataset}/synth_val_split_{s}.pt)   │
+│   c. Fit scaler on X_syn                                                                               │
+│   d. Scale all real data with that scaler                                                              │
+│   e. Extract loss features for all real samples                                                        │
+│   f. Load the already-trained MLP classifier                                                           │
+│   g. Predict membership scores                                                                         │
+│   h. Compare to ground-truth labels from NoisyDiffusion splits.yaml (always uses ND labels here, since │
+│  these are ND models)                                                                                  │
+│   i. Print ACC, TPR@10%FPR per split                                                                   │
+│                                                                                                        │
+│ Modify step_train_classifier()                                                                         │
+│ - Default train/val split: 70/30 ratio of NUM_CUSTOM_SPLITS (or NUM_SPLITS for ND mode)                │
+│ - train_splits = list(range(1, int(N * 0.7) + 1)), val_splits = list(range(int(N * 0.7) + 1, N + 1))   │
+│ - For N=5: splits 1-3 train, 4-5 val (same as current)                                                 │
+│ - For N=10: splits 1-7 train, 8-10 val                                                                 │
+│                                                                                                        │
+│ Modify run_full_pipeline()                                                                             │
+│ - Insert step_generate_splits() before step 1 (when SPLIT_MODE == "custom")                            │
+│ - Insert step_validate_synthetic() after per-split evaluation, before challenge prediction             │
+│ - Compute train/val splits from 70/30 ratio                                                            │
+│ - Updated step numbering in print statements                                                           │
+│                                                                                                        │
+│ 4. Pipeline Flow (updated)                                                                             │
+│                                                                                                        │
+│ STEP 0 (if custom): Generate N random 80/20 splits of real data                                        │
+│ STEP 1: Train N shadow models on real data subsets (custom or ND splits)                               │
+│ STEP 2: Extract loss features for all real samples (one per shadow)                                    │
+│ STEP 3: Train MLP classifier (splits 1..N-2 train, last 2 val)                                         │
+│ STEP 4: Per-split evaluation (existing, on real-data shadows)                                          │
+│ STEP 5: Synthetic validation (NEW — train on ND synth, evaluate MLP)                                   │
+│ STEP 6: Challenge prediction (existing target proxy step)                                              │
+│                                                                                                        │
+│                                                                                                        │
+│ Verification                                                                                           │
+│                                                                                                        │
+│ 1. Run with SPLIT_MODE = "custom", NUM_CUSTOM_SPLITS = 5 — should produce comparable per-split TPR to  │
+│ current results                                                                                        │
+│ 2. Check splits.json is saved and deterministic (re-run produces same splits)                          │
+│ 3. Synthetic validation step should show per-split TPR@10%FPR — compare to per-split eval from step 4  │
+│ to quantify the domain gap                                                                             │
+│ 4. Challenge prediction step unchanged                                                                 │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────╯

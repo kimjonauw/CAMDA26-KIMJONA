@@ -1,0 +1,82 @@
+Plan: Named Config Profiles + MLP Tuning for RNA-seq Domain
+
+ Context
+
+ The MLP hyperparameters are copied from MIDST (10-feature tabular data, 30 shadow models, ~180k MLP
+ training samples). Our RNA-seq domain has 978 features and far fewer MLP training samples (~5-16k). This
+  means:
+ - Overparameterized MLP (2100-dim input, 200-dim hidden) for small training sets
+ - Redundant noise vectors (978-dim MSE is stable; 300 noises adds little variance)
+ - No regularization (no dropout, no weight decay)
+
+ We want all recommended changes while preserving the current config, switchable via --profile.
+
+ Key principle: Raw features are always saved as-is. Summarization happens at MLP time. Changing profiles
+  never requires re-running shadow training. Only re-run feature extraction if T_LIST or N_NOISE change.
+
+ Profiles
+
+ ┌──────────────────┬────────────────────────┬──────────────────────────┐
+ │    Parameter     │        baseline        │          tuned           │
+ ├──────────────────┼────────────────────────┼──────────────────────────┤
+ │ T_LIST           │ [5,10,20,30,40,50,100] │ [1,2,5,10,20,50,100,200] │
+ ├──────────────────┼────────────────────────┼──────────────────────────┤
+ │ N_NOISE          │ 300                    │ 100                      │
+ ├──────────────────┼────────────────────────┼──────────────────────────┤
+ │ FEATURE_MODE     │ "raw" (2100 dims)      │ "summary" (32 dims)      │
+ ├──────────────────┼────────────────────────┼──────────────────────────┤
+ │ MLP_HIDDEN_DIM   │ 200                    │ 64                       │
+ ├──────────────────┼────────────────────────┼──────────────────────────┤
+ │ MLP_DROPOUT      │ 0.0                    │ 0.3                      │
+ ├──────────────────┼────────────────────────┼──────────────────────────┤
+ │ MLP_WEIGHT_DECAY │ 0.0                    │ 1e-3                     │
+ ├──────────────────┼────────────────────────┼──────────────────────────┤
+ │ MLP_EPOCHS       │ 750                    │ 750                      │
+ ├──────────────────┼────────────────────────┼──────────────────────────┤
+ │ MLP_LR           │ 1e-4                   │ 1e-4                     │
+ └──────────────────┴────────────────────────┴──────────────────────────┘
+
+ Summary mode: per-timestep mean, std, min, max across noises → 4 × len(T_LIST) features.
+
+ Files to Modify
+
+ 1. mia/config.py
+
+ - Add new defaults: MLP_DROPOUT = 0.0, MLP_WEIGHT_DECAY = 0.0, FEATURE_MODE = "raw", ACTIVE_PROFILE =
+ "baseline"
+ - Add PROFILES dict with both profiles
+ - Add apply_profile(name) that sets module-level vars + recomputes MLP_INPUT_DIM
+
+ 2. mia/loss_features.py
+
+ - Add summarize_features(raw, n_noise, n_t): reshape to (n_samples, n_t, n_noise), compute
+ mean/std/min/max per timestep → (n_samples, n_t×4)
+ - Add prepare_features(raw): dispatch on config.FEATURE_MODE — "raw" returns as-is, "summary" calls
+ summarize
+
+ 3. mia/classifier.py
+
+ - MembershipMLP.__init__: add dropout param (default 0.0), insert nn.Dropout after each tanh when > 0
+ - train_classifier(): pass config.MLP_DROPOUT to model, add weight_decay=config.MLP_WEIGHT_DECAY to Adam
+ - load_classifier(): pass config.MLP_DROPOUT to match saved architecture
+
+ 4. mia/attack.py
+
+ - Import prepare_features
+ - Apply in: step_train_classifier._load(), per-split eval loop, step_validate_synthetic,
+ step_predict_challenge
+ - __main__: add --profile arg, call config.apply_profile() before pipeline
+ - Print active profile at pipeline start
+
+ 5. mia/attack_synth_shadow.py
+
+ - Same as attack.py: import prepare_features, apply in _load/eval/predict, add --profile CLI arg
+
+ Verification
+
+ 1. --profile baseline produces identical results to current code
+ 2. --profile tuned on existing 300-noise features: summary mode will work (reshapes correctly), but
+ T_LIST mismatch requires re-extraction for full tuned profile
+ 3. Quick test: temporarily keep baseline T_LIST in tuned profile to test summary+dropout+weight_decay
+ without re-extraction
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌

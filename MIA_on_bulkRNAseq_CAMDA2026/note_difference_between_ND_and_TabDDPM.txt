@@ -1,0 +1,58 @@
+  ---                                                                                                             
+  Architecture Comparison: NoisyDiffusion vs. TabDDPM                                                             
+                                                                                                                  
+  Backbone Network                                                                                                
+                                                                                                                  
+  Both use MLP-based residual networks (not UNets like image DDPMs), but differ in details:                       
+
+  Column 1: Block type
+  NoisyDiffusion: ResLinear (concat conditioning at every layer)                                                  
+  TabDDPM: ResNet-style MLP (add time embedding to hidden state)                                                  
+  ────────────────────────────────────────
+  Column 1: Normalization
+  NoisyDiffusion: GroupNorm
+  TabDDPM: LayerNorm
+  ────────────────────────────────────────
+  Column 1: Activation
+  NoisyDiffusion: SiLU (Swish)
+  TabDDPM: SiLU
+  ────────────────────────────────────────
+  Column 1: Attention
+  NoisyDiffusion: Optional self-attn (disabled by default)
+  TabDDPM: None
+
+  Time Conditioning
+
+  - NoisyDiffusion: Sinusoidal embeddings → 2-layer MLP → concatenated with input at every residual block
+  - TabDDPM: Sinusoidal embeddings → added (not concatenated) to the hidden state
+
+  Handling Mixed Data Types
+
+  This is a major architectural difference:
+
+  - TabDDPM: Explicitly designed for mixed tabular data — uses Gaussian diffusion for numerical features and
+  Multinomial diffusion for categorical features, with separate forward/reverse processes
+  - NoisyDiffusion: Treats everything as continuous (only Gaussian diffusion, MSE loss on noise). Works for
+  RNA-seq since all 978 features are continuous gene expression values. Categorical features would need to be
+  pre-encoded.
+
+  Class Conditioning
+
+  - NoisyDiffusion: nn.Embedding → 64-dim vector, concatenated with time embedding, passed to every layer
+  - TabDDPM: Often uses classifier-free guidance — the model is trained both conditioned and unconditionally, then
+   guided at inference time. More flexible but more complex.
+
+  Noise Schedule
+
+  Both support cosine and linear schedules (cosine is default for both).
+
+  Summary
+
+  NoisyDiffusion is essentially a simplified, continuous-only TabDDPM variant tailored for RNA-seq:
+  - Drops multinomial diffusion (not needed for gene expression)
+  - Uses GroupNorm instead of LayerNorm
+  - Conditions via concatenation rather than addition
+  - Adds optional attention (disabled by default)
+  - Adds (weak) DP-SGD gradient noise
+
+  The core diffusion math and MLP-residual backbone are essentially the same family of approach.
