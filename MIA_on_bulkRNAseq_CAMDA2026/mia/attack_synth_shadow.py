@@ -302,9 +302,15 @@ def step_train_shadows(dataset_name, splits=None, device=None):
             print(f"  Synth-shadow split {s} exists: {save_path} (skipping)")
             continue
         print(f"\n{'='*60}\nTraining synth-shadow: {dataset_name} split {s}\n{'='*60}")
-        X_syn, _ = load_nd_synthetic(dataset_name, s)
-        train_shadow_model(X_syn, save_path, split_no=s, device=device)
-
+        X_syn, y_str = load_nd_synthetic(dataset_name, s)
+        train_shadow_model(
+            X_train=X_syn,
+            save_path=save_path,
+            split_no=s,
+            device=device,
+            y_str=y_str,
+            dataset_name=dataset_name,
+        )
 
 # ── Step 2 ────────────────────────────────────────────────────────────────────
 def step_extract_features(dataset_name, splits=None, device=None):
