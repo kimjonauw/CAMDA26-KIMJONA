@@ -7,13 +7,27 @@ KEY FIX (2026-04-10):
   them directly — so every reported per-split number is a genuine held-out
   estimate, and ensemble blend weights are computed on the same honest scores.
 
+KEY FIX (2026-04-20) — Optuna feature-selection leak (hard seal):
+  Optuna previously ran on ALL 5 splits pooled, letting it see held-out eval
+  splits when choosing the T-subset (feature selection) and noise budget.
+
+  Fix: splits are partitioned into two non-overlapping zones:
+    OPTUNA_ZONE  (splits 1-3, 0-based idx 0-2):
+        Optuna sees ONLY these splits. T-subset and hparams are tuned here.
+    EVAL_ZONE    (splits 4-5, 0-based idx 3-4):
+        _loso_cv_tpr iterates val_s over EVAL_ZONE indices ONLY.
+        But the training pool inside each fold is ALL other splits (1-4 when
+        val=5, 1-3+5 when val=4) — so no training starvation.
+
+  The final model (Step 5, challenge inference) still trains on all splits.
+
 Architecture:
   - Step 2: extract FULL superset grid (n_samples, N_T_SUPERSET * N_NOISE) once
-  - Optuna (trees only): jointly searches T-subset, n_noise, clf hparams
+  - Optuna (trees only): T-subset + hparams tuned on OPTUNA_ZONE (S1-S3) only
   - MLP: fixed signal params, no Optuna
-  - LOSO-CV (5-fold): every split is val exactly once — honest reported metric
+  - LOSO-CV: val_s iterates over EVAL_ZONE; training uses all other splits
   - Final model: trained on ALL 5 splits (for challenge inference only)
-  - Evaluation / ensemble: uses LOSO-cached scores, NOT final-model scores
+  - Evaluation / ensemble: uses LOSO-cached scores from EVAL_ZONE
 """
 
 import os
@@ -173,11 +187,11 @@ _SUGGEST = {
 }
 
 
-# ── Optuna objective — row-level KFold on all 5 splits pooled ────────────────
-def _make_objective(clf_name, raw_all, y_all, n_folds):
-    """Optuna searches hparams only. Uses row-level CV on all 5 splits pooled.
-    This is fine because Optuna does NOT produce the reported val metric —
-    that comes from the honest LOSO-CV in step_train_classifiers.
+# ── Optuna objective — row-level KFold on OPTUNA_ZONE only ───────────────────
+def _make_objective(clf_name, raw_opt, y_opt, n_folds):
+    """Optuna objective — row-level KFold on OPTUNA_ZONE splits ONLY.
+    EVAL_ZONE splits (S4, S5) are never passed here, so T-subset selection
+    cannot be informed by held-out evaluation data.
     """
     entry   = get_classifier(clf_name)
     suggest = _SUGGEST[clf_name]
@@ -188,14 +202,14 @@ def _make_objective(clf_name, raw_all, y_all, n_folds):
         noise_budget = trial.suggest_int("n_noise", 150, config.N_NOISE, step=50)
         n_t          = len(t_indices)
 
-        X_sliced = slice_raw_features(raw_all, t_indices, noise_budget)
+        X_sliced = slice_raw_features(raw_opt, t_indices, noise_budget)
         X_feat   = summarize_features(X_sliced, noise_budget, n_t)
         hparams  = suggest(trial)
 
         fold_tprs = []
-        for fold_idx, (tr_idx, vl_idx) in enumerate(skf.split(X_feat, y_all)):
-            X_tr, y_tr = X_feat[tr_idx], y_all[tr_idx]
-            X_vl, y_vl = X_feat[vl_idx], y_all[vl_idx]
+        for fold_idx, (tr_idx, vl_idx) in enumerate(skf.split(X_feat, y_opt)):
+            X_tr, y_tr = X_feat[tr_idx], y_opt[tr_idx]
+            X_vl, y_vl = X_feat[vl_idx], y_opt[vl_idx]
             tmp_dir = f"/tmp/optuna_{clf_name}_t{trial.number}_f{fold_idx}"
             try:
                 clf, _  = entry.train(X_tr, y_tr, X_vl, y_vl, tmp_dir, hparams=hparams)
@@ -210,8 +224,8 @@ def _make_objective(clf_name, raw_all, y_all, n_folds):
     return objective
 
 
-def run_optuna(clf_name, raw_all, y_all, dataset_name):
-    """Run Optuna on all-5-splits pooled data. Returns best params dict."""
+def run_optuna(clf_name, raw_opt, y_opt, dataset_name):
+    """Run Optuna on OPTUNA_ZONE splits (S1-S3) only. Returns best params dict."""
     out_dir    = _optuna_dir(dataset_name, clf_name)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -250,9 +264,9 @@ def run_optuna(clf_name, raw_all, y_all, dataset_name):
     n_trials = config.OPTUNA_N_TRIALS
     n_folds  = config.OPTUNA_CV_FOLDS
     print(f"\n  [Optuna/{clf_name.upper()}] {n_trials} trials × {n_folds}-fold CV  "
-          f"on ALL 5 splits pooled (row-level) ...")
+          f"on OPTUNA_ZONE splits only (leak-free) ...")
 
-    objective = _make_objective(clf_name, raw_all, y_all, n_folds)
+    objective = _make_objective(clf_name, raw_opt, y_opt, n_folds)
     study.optimize(
         objective,
         n_trials=n_trials,
@@ -273,29 +287,36 @@ def run_optuna(clf_name, raw_all, y_all, dataset_name):
 
 
 def _params_to_t_indices_and_noise(best_params):
-    selected = []
+    t_indices = []
     for name in T_GROUP_NAMES:
         if best_params.get(f"use_{name}", False):
-            selected.extend(T_GROUPS[name])
-    if len(selected) < 3:
-        selected = sorted(set(selected) | set(T_GROUPS["early"]) | set(T_GROUPS["mid"]))
-    t_indices    = sorted(set(selected))
-    noise_budget = best_params.get("n_noise", config.N_NOISE)
+            t_indices.extend(T_GROUPS[name])
+    if len(t_indices) < 3:
+        fallback = T_GROUPS["early"] + T_GROUPS["mid"]
+        t_indices = sorted(set(t_indices) | set(fallback))
+    else:
+        t_indices = sorted(set(t_indices))
+    noise_budget = int(best_params.get("n_noise", config.N_NOISE))
     return t_indices, noise_budget
 
 
 def _extract_clf_hparams(best_params, clf_name):
-    signal_keys = {f"use_{g}" for g in T_GROUP_NAMES} | {"n_noise"}
-    return {k: v for k, v in best_params.items() if k not in signal_keys}
+    keep = {}
+    for k, v in best_params.items():
+        if k.startswith("use_") or k == "n_noise":
+            continue
+        keep[k] = v
+    return keep
 
 
 # ── Step 1 ────────────────────────────────────────────────────────────────────
 def step_train_shadows(dataset_name, splits=None, device=None):
-    splits   = splits or list(range(1, config.NUM_SPLITS + 1))
-    device   = device or config.DEVICE
-    save_dir = _shadow_model_dir(dataset_name)
-    force    = _force("shadows")
+    splits    = splits or list(range(1, config.NUM_SPLITS + 1))
+    device    = device or config.DEVICE
+    save_dir  = _shadow_model_dir(dataset_name)
+    os.makedirs(save_dir, exist_ok=True)
 
+    force = _force("shadows")
     for s in splits:
         save_path = os.path.join(save_dir, f"shadow_split_{s}.pt")
         if not force and os.path.exists(save_path):
@@ -372,25 +393,36 @@ def step_extract_features(dataset_name, splits=None, device=None):
 
 # ── LOSO-CV — caches per-fold scores for honest evaluation in Step 4 ─────────
 def _loso_cv_tpr(clf_name, entry, raw_splits, y_splits,
-                 t_indices, noise_budget, clf_hparams):
+                 t_indices, noise_budget, clf_hparams,
+                 eval_indices=None):
     """Leave-one-split-out CV.
+
+    Parameters
+    ----------
+    eval_indices : list[int] or None
+        0-based indices into raw_splits that are used as the validation set.
+        Training pool for each fold = ALL other splits (not just other eval
+        splits).  If None, defaults to range(len(raw_splits)) — original
+        behaviour where every split is val exactly once.
 
     Returns
     -------
-    mean_tpr      : float  — mean TPR@10%FPR across all folds
-    mean_auc      : float  — mean AUC across all folds
+    mean_tpr      : float  — mean TPR@10%FPR across eval folds
+    mean_auc      : float  — mean AUC across eval folds
     fold_tprs     : list   — per-fold TPR@10%FPR
     fold_scores   : dict   — {val_split_idx (0-based): np.ndarray of scores}
     fold_y        : dict   — {val_split_idx (0-based): np.ndarray of labels}
     fold_aucs     : list   — per-fold AUC
     """
     n_splits    = len(raw_splits)
+    if eval_indices is None:
+        eval_indices = list(range(n_splits))
     fold_tprs   = []
     fold_aucs   = []
-    fold_scores = {}   # keyed by 0-based split index
+    fold_scores = {}   # keyed by 0-based split index (e.g. 3, 4 for EVAL_ZONE)
     fold_y      = {}
 
-    for val_s in range(n_splits):
+    for val_s in eval_indices:  # iterate ONLY over eval folds
         train_idx = [i for i in range(n_splits) if i != val_s]
 
         raw_tr = np.concatenate([raw_splits[i] for i in train_idx])
@@ -447,15 +479,14 @@ def _loso_cv_tpr(clf_name, entry, raw_splits, y_splits,
 
 # ── Step 3 ────────────────────────────────────────────────────────────────────
 def step_train_classifiers(dataset_name, device=None):
-    """Train classifiers with full LOSO-CV val estimate.
+    """Train classifiers with leak-free Optuna + EVAL_ZONE LOSO estimate.
 
     Flow:
-      1. Optuna (tree models only) — row-level KFold on ALL 5 splits pooled.
-         Finds best hparams + signal params.  Does NOT produce the reported
-         val metric.
-      2. LOSO-CV — every split is held-out exactly once.  Trains on 4 splits,
-         scores the 1 held-out.  Per-fold scores are CACHED for Step 4 so
-         Step 4 never touches the final model for evaluation.
+      1. Optuna (tree models only) — row-level KFold on OPTUNA_ZONE only.
+         Finds best hparams + signal params (T-subset, n_noise).  EVAL_ZONE is
+         completely sealed off.
+      2. LOSO-CV — val restricted to EVAL_ZONE only, but each fold trains on
+         ALL non-val splits.  Per-fold scores are cached for Step 4.
       3. Final model — trains on ALL 5 splits with best hparams.
          Used ONLY for challenge inference (Step 5).
 
@@ -479,12 +510,32 @@ def step_train_classifiers(dataset_name, device=None):
     raw_all = np.concatenate(raw_splits)
     y_all   = np.concatenate(y_splits)
 
+    # ── Zone split: Optuna must never see EVAL_ZONE data ─────────────────────
+    # OPTUNA_ZONE  = splits 1..ceil(n*0.6)  — T-subset / hparam search only
+    # EVAL_ZONE    = splits ceil(n*0.6)+1..n — val targets for honest LOSO
+    #
+    # IMPORTANT: _loso_cv_tpr is still passed the FULL raw_splits list so that
+    # each eval fold trains on all non-val splits (e.g. S1-S4 when val=S5).
+    # eval_indices kwarg restricts WHICH folds are used as validation.
+    import math
+    n_opt_splits  = math.ceil(n_splits * 0.6)          # 3 of 5 by default
+    opt_indices   = list(range(n_opt_splits))           # 0-based: [0, 1, 2]
+    eval_indices  = list(range(n_opt_splits, n_splits)) # 0-based: [3, 4]
+
+    raw_opt = np.concatenate([raw_splits[i] for i in opt_indices])
+    y_opt   = np.concatenate([y_splits[i]   for i in opt_indices])
+
     print(f"\nLoaded {n_splits} splits:")
     for i, (r, y) in enumerate(zip(raw_splits, y_splits)):
-        print(f"  S{i+1}: {r.shape}  members={int(y.sum())}  "
+        zone = "OPTUNA_ZONE" if i in opt_indices else "EVAL_ZONE "
+        print(f"  S{i+1} [{zone}]: {r.shape}  members={int(y.sum())}  "
               f"non={len(y)-int(y.sum())}  imbalance={int(y.sum())/len(y):.3f}")
-    print(f"Pooled: {raw_all.shape}  "
+    print(f"Pooled (all 5):       {raw_all.shape}  "
           f"members={int(y_all.sum())}  non={len(y_all)-int(y_all.sum())}")
+    print(f"Pooled (optuna S1-S{n_opt_splits}): {raw_opt.shape}  "
+          f"members={int(y_opt.sum())}  non={len(y_opt)-int(y_opt.sum())}")
+    print(f"Eval zone: S{n_opt_splits+1}-S{n_splits}  "
+          f"({len(eval_indices)} folds held-out from Optuna)")
 
     results = {}
     for clf_name in config.ACTIVE_CLASSIFIERS:
@@ -516,9 +567,9 @@ def step_train_classifiers(dataset_name, device=None):
             selected_ts = [config.T_SUPERSET[i] for i in t_indices]
             print(f"  [MLP] Fixed signal: T={selected_ts}  n_noise={noise_budget}")
 
-        # ── Tree models: Optuna on all 5 splits pooled ───────────────────────
+        # ── Tree models: Optuna on OPTUNA_ZONE only ───────────────────────────
         elif config.OPTUNA_ENABLED:
-            best_params             = run_optuna(clf_name, raw_all, y_all, dataset_name)
+            best_params             = run_optuna(clf_name, raw_opt, y_opt, dataset_name)
             t_indices, noise_budget = _params_to_t_indices_and_noise(best_params)
             clf_hparams             = _extract_clf_hparams(best_params, clf_name)
             selected_ts             = [config.T_SUPERSET[i] for i in t_indices]
@@ -531,15 +582,20 @@ def step_train_classifiers(dataset_name, device=None):
             clf_hparams  = None
             selected_ts  = list(config.T_SUPERSET)
 
-        # ── LOSO-CV: honest val estimate — every split is val once ───────────
-        print(f"\n  [LOSO] {n_splits}-fold leave-one-split-out CV ...")
+        # ── LOSO-CV: val restricted to EVAL_ZONE; trains on all other splits ──
+        # Pass FULL raw_splits so each fold trains on 4 splits (not 1).
+        # eval_indices kwarg ensures only S4/S5 are ever used as val targets.
+        print(f"\n  [LOSO] {len(eval_indices)}-fold LOSO on EVAL_ZONE "
+              f"(S{n_opt_splits+1}-S{n_splits}) "
+              f"— T-subset tuned on S1-S{n_opt_splits} only ...")
         (val_tpr, val_auc,
          loso_fold_tprs,
          loso_fold_scores,
          loso_fold_y,
          loso_fold_aucs) = _loso_cv_tpr(
-            clf_name, entry, raw_splits, y_splits,
-            t_indices, noise_budget, clf_hparams
+            clf_name, entry, raw_splits, y_splits,   # full 5-split list
+            t_indices, noise_budget, clf_hparams,
+            eval_indices=eval_indices                 # val on S4, S5 only
         )
 
         # ── Final model: train on ALL 5 splits (challenge inference only) ────
@@ -572,8 +628,8 @@ def step_train_classifiers(dataset_name, device=None):
             t_indices, noise_budget,
             val_tpr, val_auc,
             selected_ts, loso_fold_tprs,
-            loso_fold_scores,   # {0-based fold idx → scores array}
-            loso_fold_y,        # {0-based fold idx → labels array}
+            loso_fold_scores,   # {0-based split idx → scores array}
+            loso_fold_y,        # {0-based split idx → labels array}
             loso_fold_aucs,     # per-fold AUC list
         )
 
@@ -582,14 +638,14 @@ def step_train_classifiers(dataset_name, device=None):
 
 # ── Step 4 ────────────────────────────────────────────────────────────────────
 def step_evaluate_classifiers(dataset_name, trained_results):
-    """Evaluation using LOSO-cached scores — no final-model re-scoring.
+    """Evaluation using LOSO-cached scores from EVAL_ZONE only.
 
-    FIX: The old version re-scored each split with the final model (trained on
-    ALL 5 splits), producing in-sample AUC=1.000 for LGBM/CAT.  Now we reuse
-    the per-fold scores cached by _loso_cv_tpr() in Step 3.  Every reported
-    number is a genuine held-out estimate.
-
-    Ensemble blend also uses LOSO scores, so ensemble AUC is honest too.
+    FIX (2026-04-10): no final-model re-scoring — avoids in-sample AUC=1.000.
+    FIX (2026-04-20): loso_fold_scores are keyed by 0-based EVAL_ZONE indices
+    (e.g. 3, 4).  This function maps them back to 1-based global split labels
+    (4, 5) for display.  All metrics are from classifiers that trained on
+    Splits 1-4 and were tested on Split 5 (and vice versa), with the T-subset
+    that was tuned exclusively on S1-S3.
     """
     n_splits    = config.NUM_SPLITS
     fpr_targets = [0.01, 0.05, 0.10, 0.20]
@@ -597,48 +653,50 @@ def step_evaluate_classifiers(dataset_name, trained_results):
     summary    = {clf_name: {} for clf_name in trained_results}
     summary["ensemble"] = {}
 
-    # ── Phase 1: Collect LOSO scores for each split ───────────────────────────
-    split_scores = {}  # {s (1-based): {clf_name: scores}}
-    split_y      = {}  # {s (1-based): y_member array}
+    # ── Phase 1: Collect LOSO scores for EVAL_ZONE splits only ─────────────
+    # loso_fold_scores / loso_fold_y are keyed by 0-based split index
+    # matching eval_indices (e.g. keys 3, 4 for default 5-split setup).
+    # global_s = val_s + 1  converts to the 1-based split label used in logs.
+    ref_clf          = next(iter(trained_results))
+    loso_keys_0based = sorted(trained_results[ref_clf][9].keys())  # e.g. [3, 4]
 
-    for s in range(1, n_splits + 1):
-        fold_idx = s - 1
-        split_scores[s] = {}
-        ref_clf = next(iter(trained_results))
-        split_y[s] = trained_results[ref_clf][9][fold_idx]  # loso_fold_y
+    split_scores = {}  # {global_s (1-based): {clf_name: scores}}
+    split_y      = {}  # {global_s (1-based): y_member array}
+
+    for val_s in loso_keys_0based:
+        global_s = val_s + 1
+        split_scores[global_s] = {}
+        split_y[global_s] = trained_results[ref_clf][9][val_s]  # loso_fold_y
 
     for clf_name, entry_tuple in trained_results.items():
         (clf, history, t_indices, noise_budget,
          val_tpr, val_auc, selected_ts, loso_fold_tprs,
          loso_fold_scores, loso_fold_y, loso_fold_aucs) = entry_tuple
 
-        for s in range(1, n_splits + 1):
-            fold_idx = s - 1
-            scores   = loso_fold_scores[fold_idx]
-            y_member = loso_fold_y[fold_idx]
+        for idx, val_s in enumerate(loso_keys_0based):
+            global_s = val_s + 1
+            scores   = loso_fold_scores[val_s]
+            y_member = loso_fold_y[val_s]
 
-            split_scores[s][clf_name] = scores
+            split_scores[global_s][clf_name] = scores
 
             tpr       = _tpr_at_fpr(y_member.astype(int), scores)
-            auc       = loso_fold_aucs[fold_idx]
+            auc       = loso_fold_aucs[idx]   # list is positional (len=n_eval_folds)
             multi_fpr = tpr_at_fpr_multi(y_member.astype(int), scores)
 
             print(
-                f"  [{clf_name.upper():4s}] Split {s} [LOSO held-out]: "
+                f"  [{clf_name.upper():4s}] Split {global_s} [EVAL_ZONE LOSO held-out]: "
                 f"TPR@1%={multi_fpr[0.01]:.4f}  TPR@5%={multi_fpr[0.05]:.4f}  "
                 f"TPR@10%={multi_fpr[0.10]:.4f}  TPR@20%={multi_fpr[0.20]:.4f}  "
                 f"AUC={auc:.4f}  "
                 f"(members={int(y_member.sum())}, "
                 f"non-members={len(y_member)-int(y_member.sum())})"
             )
-            summary[clf_name][s] = {"tpr": tpr, "auc": auc, "multi_fpr": multi_fpr}
+            summary[clf_name][global_s] = {"tpr": tpr, "auc": auc, "multi_fpr": multi_fpr}
 
     # ── Phase 2: Softmax weights from LOSO mean AUC ──────────────────────────
-    # FIX: build loso_aucs dict here from trained_results (index 5 = val_auc)
-    # FIX: use config.ENSEMBLE_* not cfg.*
     loso_aucs = {n: float(trained_results[n][5]) for n in trained_results}
 
-    # Guard: if ALL classifiers are below the gate, fall back to equal weights
     gate_threshold = config.ENSEMBLE_MIN_AUC_GATE
     n_above_gate   = sum(1 for v in loso_aucs.values() if v >= gate_threshold)
     if n_above_gate == 0:
@@ -646,7 +704,6 @@ def step_evaluate_classifiers(dataset_name, trained_results):
             f"[ENSEMBLE] All classifiers below LOSO AUC gate={gate_threshold:.2f}. "
             "Falling back to equal weights across all classifiers."
         )
-        # Temporarily zero out the gate so compute_softmax_weights uses all
         gate_threshold = 0.0
 
     softmax_w = compute_softmax_weights(
@@ -658,23 +715,22 @@ def step_evaluate_classifiers(dataset_name, trained_results):
     print(f"\n  [ENSEMBLE WEIGHTS]  "
           f"temperature={config.ENSEMBLE_TEMPERATURE}  "
           f"min_auc_gate={config.ENSEMBLE_MIN_AUC_GATE}  "
-          f"(LOSO AUC — all 5 folds)")
+          f"(LOSO AUC — EVAL_ZONE only)")
     for clf_name, w in softmax_w.items():
         gated = w < 1e-6
-        status = "GATED" if gated else "active"
         print(f"  [ENSEMBLE] {'⚠ ' if gated else '  '}"
               f"{clf_name.upper():<6}  weight={w:.4f}  "
               f"loso_auc={loso_aucs[clf_name]:.4f}"
               + (f"  (< gate={config.ENSEMBLE_MIN_AUC_GATE})" if gated else ""))
 
     # ── Phase 3: Ensemble blend on LOSO held-out scores ──────────────────────
-    print(f"\n  [ENSEMBLE EVALUATION]  (LOSO held-out scores only)")
-    for s in range(1, n_splits + 1):
-        y_member   = split_y[s]
+    print(f"\n  [ENSEMBLE EVALUATION]  (EVAL_ZONE LOSO held-out scores only)")
+    for global_s in sorted(split_y.keys()):
+        y_member   = split_y[global_s]
         ens_scores = np.zeros(len(y_member), dtype=np.float64)
 
         for clf_name, w in softmax_w.items():
-            ens_scores += split_scores[s][clf_name] * w
+            ens_scores += split_scores[global_s][clf_name] * w
 
         tpr       = _tpr_at_fpr(y_member.astype(int), ens_scores)
         auc       = (roc_auc_score(y_member.astype(int), ens_scores)
@@ -682,22 +738,23 @@ def step_evaluate_classifiers(dataset_name, trained_results):
         multi_fpr = tpr_at_fpr_multi(y_member.astype(int), ens_scores)
 
         print(
-            f"  [ENSM] Split {s} [LOSO held-out]: "
+            f"  [ENSM] Split {global_s} [EVAL_ZONE LOSO held-out]: "
             f"TPR@1%={multi_fpr[0.01]:.4f}  TPR@5%={multi_fpr[0.05]:.4f}  "
             f"TPR@10%={multi_fpr[0.10]:.4f}  TPR@20%={multi_fpr[0.20]:.4f}  "
             f"AUC={auc:.4f}"
         )
-        summary["ensemble"][s] = {"tpr": tpr, "auc": auc, "multi_fpr": multi_fpr}
+        summary["ensemble"][global_s] = {"tpr": tpr, "auc": auc, "multi_fpr": multi_fpr}
 
     # ── Summary table ─────────────────────────────────────────────────────────
     split_cols = "  ".join(
-        f"S{s}@10%  AUC" for s in range(1, n_splits + 1)
+        f"S{s}@10%  AUC" for s in sorted(split_y.keys())
     )
     hdr = (f"  {'CLF':<8}  {'LOSO TPR':>9}  {'LOSO AUC':>9}  "
            f"{split_cols}  {'m@10%':>7}  {'mAUC':>7}  T-subset")
     sep = "─" * max(len(hdr), 120)
     print(f"\n{sep}\n{hdr}\n{sep}")
 
+    eval_global_keys = sorted(split_y.keys())
     for clf_name, splits in summary.items():
         if clf_name == "ensemble":
             val_tpr, val_auc, selected_ts = np.nan, np.nan, "N/A (Blend)"
@@ -710,10 +767,10 @@ def step_evaluate_classifiers(dataset_name, trained_results):
 
         split_vals = "  ".join(
             f"{splits[s]['multi_fpr'][0.10]:6.4f}  {splits[s]['auc']:6.4f}"
-            for s in range(1, n_splits + 1)
+            for s in eval_global_keys
         )
-        tprs = [splits[s]["tpr"] for s in range(1, n_splits + 1)]
-        aucs = [splits[s]["auc"] for s in range(1, n_splits + 1)]
+        tprs = [splits[s]["tpr"] for s in eval_global_keys]
+        aucs = [splits[s]["auc"] for s in eval_global_keys]
         vt   = f"{val_tpr:9.4f}" if not np.isnan(val_tpr) else "      ---"
         va   = f"{val_auc:9.4f}" if not np.isnan(val_auc) else "      ---"
 
@@ -780,22 +837,17 @@ def step_predict_challenge(dataset_name, trained_results, softmax_w, device=None
           f"min_auc_gate={config.ENSEMBLE_MIN_AUC_GATE}")
     for clf_name, w in softmax_w.items():
         ensemble_scores += all_scores[clf_name] * w
-        print(f"  [ENSEMBLE]   {clf_name.upper():<6}  weight={w:.4f}"
-              + ("  (GATED)" if w < 1e-6 else ""))
+        print(f"  [ENSEMBLE]   {clf_name.upper():<6}  weight={w:.4f}")
 
     ens_path = os.path.join(
         ds["challenge_dir"],
         "synthetic_data_1_predictions_synth_shadow_ensemble.csv",
     )
-    pd.DataFrame({"sample_id": sample_ids, "score": ensemble_scores}).to_csv(
-        ens_path, index=False
-    )
-    print(f"  [ENSEMBLE] Ensemble saved → {ens_path}")
-
-    return sample_ids, all_scores
+    pd.DataFrame({"sample_id": sample_ids, "score": ensemble_scores}).to_csv(ens_path, index=False)
+    print(f"  [ENSEMBLE] → {ens_path}")
 
 
-# ── Step 6 — Report ───────────────────────────────────────────────────────────
+# ── Step 6 ────────────────────────────────────────────────────────────────────
 def generate_report(dataset_name, trained_results, split_summary, ensemble_weights):
     out_dir   = config.MIA_OUTPUT_DIR
     os.makedirs(out_dir, exist_ok=True)
@@ -813,7 +865,7 @@ def generate_report(dataset_name, trained_results, split_summary, ensemble_weigh
         "profile":               config.ACTIVE_PROFILE,
         "T_superset":            list(config.T_SUPERSET),
         "N_noise":               config.N_NOISE,
-        "val_method":            "LOSO-CV (5-fold, all splits)",
+        "val_method":            "LOSO-CV (EVAL_ZONE S4-S5 only, leak-free; trains on all other splits)",
         "mlp_T_list":            _MLP_T_LIST,
         "mlp_N_noise":           _MLP_N_NOISE,
         "mlp_hidden_dim":        _MLP_HIDDEN_DIM,
@@ -829,7 +881,8 @@ def generate_report(dataset_name, trained_results, split_summary, ensemble_weigh
     lines.append(f"  SYNTH-SHADOW MIA REPORT — {dataset_name}  [{ts}]")
     lines.append(f"  Profile: {config.ACTIVE_PROFILE}  |  T_SUPERSET={config.T_SUPERSET}")
     lines.append(
-        f"  N_NOISE={config.N_NOISE}  |  Val method: LOSO-CV (5-fold, all splits)  |  "
+        f"  N_NOISE={config.N_NOISE}  |  "
+        f"Val method: LOSO-CV (EVAL_ZONE only; trains on all non-val splits)  |  "
         f"Optuna={'ON (trees only)' if config.OPTUNA_ENABLED else 'OFF'}  |  "
         f"ensemble_temperature={config.ENSEMBLE_TEMPERATURE}  "
         f"min_auc_gate={config.ENSEMBLE_MIN_AUC_GATE}"
@@ -855,19 +908,20 @@ def generate_report(dataset_name, trained_results, split_summary, ensemble_weigh
         )
         lines.append(
             f"  {'[LOSO]':<8}  {'':>8}  {'':>8}  {val_tpr:9.4f}  {'':>9}  {val_auc:7.4f}  "
-            f"← LOSO mean (5 folds, per-fold={[f'{t:.3f}' for t in loso_folds]})"
+            f"← LOSO mean (EVAL_ZONE, {len(loso_folds)} folds, per-fold={[f'{t:.3f}' for t in loso_folds]})"
         )
 
         split_tprs_10 = []
         split_aucs    = []
         multi_fpr_agg = {t: [] for t in fpr_targets}
 
-        for s in range(1, n_splits + 1):
+        _rpt_keys = sorted(splits.keys())
+        for s in _rpt_keys:
             sp   = splits.get(s, {})
             mfp  = sp.get("multi_fpr", {t: 0.0 for t in fpr_targets})
             auc  = sp.get("auc", 0.0)
             lines.append(
-                f"  [S{s}]{'':5}  "
+                f"  [S{s} EVAL]  "
                 f"{mfp.get(0.01, 0.0):8.4f}  "
                 f"{mfp.get(0.05, 0.0):8.4f}  "
                 f"{mfp.get(0.10, 0.0):9.4f}  "
@@ -879,22 +933,23 @@ def generate_report(dataset_name, trained_results, split_summary, ensemble_weigh
             for t in fpr_targets:
                 multi_fpr_agg[t].append(mfp.get(t, 0.0))
 
-        mean_mfp = {t: float(np.mean(multi_fpr_agg[t])) for t in fpr_targets}
+        mean_mfp = {t: float(np.mean(multi_fpr_agg[t])) if len(multi_fpr_agg[t]) else 0.0
+                    for t in fpr_targets}
         lines.append(
             f"  {'[MEAN]':<8}  "
             f"{mean_mfp[0.01]:8.4f}  "
             f"{mean_mfp[0.05]:8.4f}  "
             f"{mean_mfp[0.10]:9.4f}  "
             f"{mean_mfp[0.20]:9.4f}  "
-            f"{float(np.mean(split_aucs)):7.4f}"
+            f"{float(np.mean(split_aucs)) if split_aucs else 0.0:7.4f}"
         )
 
         report_data["classifiers"][clf_name] = {
             "val_tpr_10fpr":        round(float(val_tpr), 6),
             "val_auc":              round(float(val_auc), 6),
             "loso_fold_tprs":       [round(float(t), 6) for t in loso_folds],
-            "mean_split_tpr_10fpr": round(float(np.mean(split_tprs_10)), 6),
-            "mean_split_auc":       round(float(np.mean(split_aucs)), 6),
+            "mean_split_tpr_10fpr": round(float(np.mean(split_tprs_10)) if split_tprs_10 else 0.0, 6),
+            "mean_split_auc":       round(float(np.mean(split_aucs)) if split_aucs else 0.0, 6),
             "mean_multi_fpr":       {str(t): round(mean_mfp[t], 6) for t in fpr_targets},
             "selected_ts":          [int(t) for t in selected_ts],
             "optuna":               clf_name not in _NO_OPTUNA_CLASSIFIERS,
@@ -908,11 +963,10 @@ def generate_report(dataset_name, trained_results, split_summary, ensemble_weigh
                     },
                     "auc": round(float(splits.get(s, {}).get("auc", 0.0)), 6),
                 }
-                for s in range(1, n_splits + 1)
+                for s in _rpt_keys
             },
         }
 
-    # ── Ensemble section ──────────────────────────────────────────────────────
     ens_splits   = split_summary.get("ensemble", {})
     ens_tprs_10  = []
     ens_aucs     = []
@@ -923,12 +977,13 @@ def generate_report(dataset_name, trained_results, split_summary, ensemble_weigh
         f"  {'':8}  {'@1%FPR':>8}  {'@5%FPR':>8}  {'@10%FPR':>9}  {'@20%FPR':>9}  {'AUC':>7}"
     )
 
-    for s in range(1, n_splits + 1):
+    _ens_rpt_keys = sorted(ens_splits.keys()) if ens_splits else []
+    for s in _ens_rpt_keys:
         sp  = ens_splits.get(s, {})
         mfp = sp.get("multi_fpr", {t: 0.0 for t in fpr_targets})
         auc = sp.get("auc", 0.0)
         lines.append(
-            f"  [S{s}]{'':5}  "
+            f"  [S{s} EVAL]  "
             f"{mfp.get(0.01, 0.0):8.4f}  "
             f"{mfp.get(0.05, 0.0):8.4f}  "
             f"{mfp.get(0.10, 0.0):9.4f}  "
@@ -940,19 +995,20 @@ def generate_report(dataset_name, trained_results, split_summary, ensemble_weigh
         for t in fpr_targets:
             ens_mfpr_agg[t].append(mfp.get(t, 0.0))
 
-    ens_mean_mfp = {t: float(np.mean(ens_mfpr_agg[t])) for t in fpr_targets}
+    ens_mean_mfp = {t: float(np.mean(ens_mfpr_agg[t])) if len(ens_mfpr_agg[t]) else 0.0
+                    for t in fpr_targets}
     lines.append(
         f"  {'[MEAN]':<8}  "
         f"{ens_mean_mfp[0.01]:8.4f}  "
         f"{ens_mean_mfp[0.05]:8.4f}  "
         f"{ens_mean_mfp[0.10]:9.4f}  "
         f"{ens_mean_mfp[0.20]:9.4f}  "
-        f"{float(np.mean(ens_aucs)):7.4f}"
+        f"{float(np.mean(ens_aucs)) if ens_aucs else 0.0:7.4f}"
     )
 
     report_data["ensemble"]["performance"] = {
-        "mean_split_tpr_10fpr": round(float(np.mean(ens_tprs_10)), 6),
-        "mean_split_auc":       round(float(np.mean(ens_aucs)), 6),
+        "mean_split_tpr_10fpr": round(float(np.mean(ens_tprs_10)) if ens_tprs_10 else 0.0, 6),
+        "mean_split_auc":       round(float(np.mean(ens_aucs)) if ens_aucs else 0.0, 6),
         "mean_multi_fpr":       {str(t): round(ens_mean_mfp[t], 6) for t in fpr_targets},
         "splits": {
             str(s): {
@@ -964,7 +1020,7 @@ def generate_report(dataset_name, trained_results, split_summary, ensemble_weigh
                 },
                 "auc": round(float(ens_splits.get(s, {}).get("auc", 0.0)), 6),
             }
-            for s in range(1, n_splits + 1)
+            for s in _ens_rpt_keys
         },
     }
 
@@ -1020,13 +1076,13 @@ def run_full_pipeline(dataset_name, device=None):
     print(f"STEP 3: Train classifiers  "
           f"(MLP: fixed | trees: Optuna {'ON' if config.OPTUNA_ENABLED else 'OFF'})  "
           f"({dataset_name})")
-    print(f"        Val method: LOSO-CV (5-fold, every split is val exactly once)")
+    print(f"        Val method: EVAL_ZONE LOSO-CV (Optuna sealed to S1-S3)")
     print("=" * 70)
     trained_results = step_train_classifiers(dataset_name, device=device)
 
     print("\n" + "=" * 70)
     print(f"STEP 4: Per-split evaluation + ensemble  ({dataset_name})")
-    print(f"        (All numbers are LOSO held-out — no final-model re-scoring)")
+    print(f"        (All numbers are EVAL_ZONE LOSO held-out — no final-model re-scoring)")
     print("=" * 70)
     split_summary, ensemble_weights = step_evaluate_classifiers(
         dataset_name, trained_results
@@ -1046,44 +1102,24 @@ def run_full_pipeline(dataset_name, device=None):
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
+# ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import sys
     import argparse
     sys.stdout.reconfigure(line_buffering=True)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset",       choices=["BRCA", "COMBINED"], default="BRCA")
-    parser.add_argument("--device",        default=config.DEVICE)
-    parser.add_argument("--profile",       choices=list(config.PROFILES.keys()), default=None)
-    parser.add_argument("--classifiers",   default=None)
-    parser.add_argument("--no-optuna",     action="store_true")
-    parser.add_argument("--optuna-trials", type=int, default=None)
-    parser.add_argument("--force",         default="")
+    parser.add_argument("--dataset", choices=["BRCA", "COMBINED"], default="COMBINED")
+    parser.add_argument(
+        "--force",
+        type=str,
+        default="",
+        help="Comma-separated list of stages to force-rerun: "
+             "shadows,features,classifier,challenge,all",
+    )
     args = parser.parse_args()
 
-    if args.force:
-        config.FORCE_STAGES = set(s.strip() for s in args.force.split(","))
-    if args.profile:
-        config.apply_profile(args.profile)
-    if args.classifiers:
-        config.ACTIVE_CLASSIFIERS = [c.strip() for c in args.classifiers.split(",")]
-    if args.no_optuna:
-        config.OPTUNA_ENABLED = False
-    if args.optuna_trials:
-        config.OPTUNA_N_TRIALS = args.optuna_trials
+    # Push --force into config so _force() picks it up everywhere
+    config.FORCE_STAGES = [s.strip() for s in args.force.split(",") if s.strip()]
 
-    print(f"Profile:            {config.ACTIVE_PROFILE}")
-    print(f"T_SUPERSET:         {config.T_SUPERSET}  ({len(config.T_SUPERSET)} steps)")
-    print(f"N_NOISE:            {config.N_NOISE}")
-    print(f"Val method:         LOSO-CV (5-fold, all splits)")
-    print(f"Active classifiers: {config.ACTIVE_CLASSIFIERS}")
-    print(f"MLP (fixed):        T={_MLP_T_LIST}  N_NOISE={_MLP_N_NOISE}  "
-          f"hidden_dim={_MLP_HIDDEN_DIM}  epochs={_MLP_EPOCHS}  "
-          f"dropout={config.MLP_DROPOUT}  lr={config.MLP_LR}")
-    print(f"Optuna (trees):     {'ON' if config.OPTUNA_ENABLED else 'OFF'}  "
-          f"({config.OPTUNA_N_TRIALS} trials × {config.OPTUNA_CV_FOLDS}-fold CV, all 5 splits pooled)")
-    print(f"Ensemble:           temperature={config.ENSEMBLE_TEMPERATURE}  "
-          f"min_auc_gate={config.ENSEMBLE_MIN_AUC_GATE}")
-    print(f"T_GROUPS:           {T_GROUPS}")
-
-    run_full_pipeline(args.dataset, device=args.device)
+    run_full_pipeline(args.dataset)
