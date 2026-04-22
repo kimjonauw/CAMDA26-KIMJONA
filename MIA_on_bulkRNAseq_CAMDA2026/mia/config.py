@@ -60,7 +60,7 @@ NORM_METHOD          = "quantile"
 
 # ── Shadow model training ─────────────────────────────────────────────────────
 SHADOW_EPOCHS                   = 200
-SHADOW_BATCH_SIZE               = 512
+SHADOW_BATCH_SIZE               = 32
 SHADOW_LR                       = 0.001
 SHADOW_LR_WEIGHT_DECAY          = 0.001
 SHADOW_LR_PCT_START             = 0.2
@@ -70,7 +70,7 @@ SHADOW_LR_ANNEAL_STRATEGY       = "cos"
 SHADOW_EARLY_STOPPING           = True
 SHADOW_EARLY_STOPPING_PATIENCE  = 30
 SHADOW_EARLY_STOPPING_MIN_DELTA = 0.0001
-SHADOW_DP_NOISE_MULTIPLIER      = 0
+SHADOW_DP_NOISE_MULTIPLIER      = 0.00001
 SHADOW_MAX_GRAD_NORM            = 1.0
 DUMMY_LABEL                     = 0
 UNCONDITIONAL_NUM_CLASSES       = 1

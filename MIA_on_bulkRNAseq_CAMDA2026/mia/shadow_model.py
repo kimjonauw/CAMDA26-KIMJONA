@@ -2,6 +2,7 @@
 
 import os
 import sys
+import pickle
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
@@ -54,6 +55,15 @@ def build_diffusion_trainer(device):
     )
 
 
+def _scaler_path(save_path):
+    """Derive the scaler pickle path from the model checkpoint path.
+
+    E.g. .../shadow_split_3.pt  →  .../shadow_split_3_scaler.pkl
+    """
+    base, _ = os.path.splitext(save_path)
+    return base + "_scaler.pkl"
+
+
 def train_shadow_model(X_train, save_path, split_no, device=None, y_str=None, dataset_name=None):
     """Train a shadow model on the provided data (unconditional, dummy label).
 
@@ -69,6 +79,13 @@ def train_shadow_model(X_train, save_path, split_no, device=None, y_str=None, da
                    Euclidean-valid space, quantile scaling destroys it).
     dataset_name : str, optional – needed to resolve label_list + smote target
                    from config.DATASETS. Inferred from save_path if None.
+
+    Returns
+    -------
+    model, diff_trainer, scaler
+        The scaler is also persisted to <save_path stem>_scaler.pkl so that
+        step_extract_features can load the *exact* quantile boundaries the
+        shadow model was trained on (including post-SMOTE density shifts).
     """
     device = device or config.DEVICE
 
@@ -78,7 +95,6 @@ def train_shadow_model(X_train, save_path, split_no, device=None, y_str=None, da
     # the k-NN geometry used by SMOTE and produce invalid synthetic samples.
     if y_str is not None:
         if dataset_name is None:
-            # infer from path: …/shadow_models/<dataset_name>/shadow_split_N.pt
             dataset_name = os.path.basename(os.path.dirname(save_path))
 
         try:
@@ -90,11 +106,9 @@ def train_shadow_model(X_train, save_path, split_no, device=None, y_str=None, da
         label_list  = ds_cfg["label_list"]
         upsample_to = ds_cfg.get("smote_upsample_to", 3000)
 
-        label_map  = {c: i for i, c in enumerate(label_list)}
+        label_map   = {c: i for i, c in enumerate(label_list)}
         y_int_smote = np.array([label_map[l] for l in y_str], dtype=np.int64)
 
-        # Only upsample classes that have fewer than upsample_to samples.
-        # Classes already at/above the target are left alone.
         counts = np.bincount(y_int_smote, minlength=len(label_list))
         sampling_strategy = {
             i: upsample_to for i, c in enumerate(counts) if c < upsample_to
@@ -113,7 +127,15 @@ def train_shadow_model(X_train, save_path, split_no, device=None, y_str=None, da
             print(f"[shadow split {split_no}] SMOTE: all classes already >= {upsample_to}, skipping")
 
     # ── QuantileTransformer (after SMOTE) ────────────────────────────────────
+    # FIX: persist this scaler so step_extract_features uses identical quantile
+    # boundaries — the post-SMOTE density is what the model's weights expect.
     scaler, X_scaled = fit_quantile_scaler(X_train)
+
+    sc_path = _scaler_path(save_path)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    with open(sc_path, "wb") as f:
+        pickle.dump(scaler, f)
+    print(f"  [shadow split {split_no}] scaler saved → {sc_path}")
 
     y_int = np.full(len(X_train), config.DUMMY_LABEL, dtype=np.int64)
     print(f"[shadow split {split_no}] training samples: {len(X_train)}, dummy label={config.DUMMY_LABEL}")
@@ -177,12 +199,33 @@ def train_shadow_model(X_train, save_path, split_no, device=None, y_str=None, da
         model.load_state_dict(best_state)
         model.to(device)
 
-    # ── Save ─────────────────────────────────────────────────────────────────
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    # ── Save model ────────────────────────────────────────────────────────────
     torch.save(model.state_dict(), save_path)
     print(f"  [shadow split {split_no}] saved → {save_path}")
 
     return model, diff_trainer, scaler
+
+
+def load_shadow_scaler(save_path):
+    """Load the persisted QuantileTransformer for a shadow model checkpoint.
+
+    Parameters
+    ----------
+    save_path : str
+        Path to the shadow model .pt file (same stem, _scaler.pkl suffix).
+
+    Returns
+    -------
+    sklearn QuantileTransformer
+    """
+    sc_path = _scaler_path(save_path)
+    if not os.path.exists(sc_path):
+        raise FileNotFoundError(
+            f"Scaler not found: {sc_path}\n"
+            "Re-run step_train_shadows (force=True) to regenerate it alongside the model."
+        )
+    with open(sc_path, "rb") as f:
+        return pickle.load(f)
 
 
 def train_target_proxy(dataset_name, device=None):
@@ -191,7 +234,6 @@ def train_target_proxy(dataset_name, device=None):
     X_syn     = load_challenge_synthetic(dataset_name)
     save_dir  = os.path.join(config.SHADOW_MODEL_DIR, dataset_name)
     save_path = os.path.join(save_dir, "target_proxy.pt")
-    # Challenge synthetic has no string labels, so y_str=None → SMOTE skipped
     return train_shadow_model(X_syn, save_path, split_no=0, device=device,
                                y_str=None, dataset_name=None)
 

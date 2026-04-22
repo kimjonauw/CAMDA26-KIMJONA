@@ -58,6 +58,8 @@ from .shadow_model import (
     build_diffusion_trainer,
     train_target_proxy,
     load_target_proxy,
+    load_shadow_scaler, 
+    _scaler_path,        
 )
 from .loss_features import (
     extract_loss_features,
@@ -336,7 +338,13 @@ def step_train_shadows(dataset_name, splits=None, device=None):
 # ── Step 2 ────────────────────────────────────────────────────────────────────
 def step_extract_features(dataset_name, splits=None, device=None):
     """Extract FULL superset grid once — shape (n_samples, N_T_SUPERSET * N_NOISE).
-    Never needs re-running unless T_SUPERSET or N_NOISE changes.
+
+    FIX (2026-04-20): load the exact QuantileTransformer that was fitted on the
+    post-SMOTE synthetic data during Step 1, rather than re-fitting a new one on
+    the raw (pre-SMOTE) X_syn.  The shadow model's weights are calibrated to the
+    post-SMOTE quantile boundaries; applying a different scaler shifts X_real
+    out-of-distribution relative to those weights, degrading loss trajectory
+    discrimination between members and non-members.
     """
     splits    = splits or list(range(1, config.NUM_SPLITS + 1))
     device    = device or config.DEVICE
@@ -375,8 +383,12 @@ def step_extract_features(dataset_name, splits=None, device=None):
         model.eval()
         diff_trainer = build_diffusion_trainer(device)
 
-        X_syn, _  = load_nd_synthetic(dataset_name, s)
-        scaler, _ = fit_quantile_scaler(X_syn)
+        # FIX: load the scaler that was fitted on post-SMOTE X_syn during Step 1,
+        # not a freshly fitted one on raw X_syn.  This guarantees the quantile
+        # boundaries match exactly what the shadow model was trained on.
+        scaler = load_shadow_scaler(ckpt)
+        print(f"  Loaded shadow scaler from {_scaler_path(ckpt)}")
+
         X_scaled  = scaler.transform(X_real_np.astype(np.float64)).astype(np.float32)
 
         features    = extract_loss_features(
@@ -389,8 +401,6 @@ def step_extract_features(dataset_name, splits=None, device=None):
                  y_label_int=y_int, sample_ids=sample_ids)
         print(f"  Saved {out_path}  shape={features.shape}  "
               f"(expected cols={len(config.T_SUPERSET) * config.N_NOISE})")
-
-
 # ── LOSO-CV — caches per-fold scores for honest evaluation in Step 4 ─────────
 def _loso_cv_tpr(clf_name, entry, raw_splits, y_splits,
                  t_indices, noise_budget, clf_hparams,
