@@ -78,11 +78,18 @@ def compute_dcr(X_syn_pca, X_real_pca, y_member, n_subsample=DCR_N_SUBSAMPLE, se
 
     ratio = d_mem / d_non
       << 1.0  →  Synthetic points spawn on top of members → memorisation exists
-      ≈  1.0  →  Synthetic equidistant to seen/unseen    → MIA bounded near 0.50
+      ≈  1.0  →  Synthetic equidistant to seen/unseen
     """
     rng         = np.random.default_rng(seed)
     members     = X_real_pca[y_member == 1]
     non_members = X_real_pca[y_member == 0]
+
+    # FIX: Balance pool sizes so the min-distance bias is symmetric
+    k = min(len(members), len(non_members))
+    if len(members) > k:
+        members = members[rng.choice(len(members), k, replace=False)]
+    if len(non_members) > k:
+        non_members = non_members[rng.choice(len(non_members), k, replace=False)]
 
     # Subsample synthetic points for speed
     if n_subsample and len(X_syn_pca) > n_subsample:
@@ -106,10 +113,10 @@ def compute_dcr(X_syn_pca, X_real_pca, y_member, n_subsample=DCR_N_SUBSAMPLE, se
 
 def _interpret_ratio(r):
     if r < 0.50:
-        return "HIGH memorisation  — synthetic clusters on members, MIA bound loose"
+        return "HIGH memorisation  — synthetic clusters on members"
     if r < 0.85:
-        return "MODERATE           — partial clustering, MIA AUC > 0.50 plausible"
-    return  "LOW memorisation   — synthetic equidistant, MIA bounded near 0.50"
+        return "MODERATE           — partial clustering, MIA leakage plausible"
+    return  "LOW memorisation   — synthetic equidistant to seen/unseen"
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -210,10 +217,11 @@ def run(dataset_name):
     print(f"       → {'Generator learned the marginal distributions' if mean_frac > 0.6 else 'Generator underfit features'}")
     print(f"\n  DCR avg ratio (synthetic → real):         {mean_ratio:.3f}")
     print(f"       → {_interpret_ratio(mean_ratio)}")
-    print(f"\n  NOTE: KS is a diagnostic only — not an MIA upper bound.")
-    print(f"        DCR ratio is your geometric bound on MIA signal.")
-    print(f"        LOSO-CV AUC remains the empirical upper bound for")
-    print(f"        your current attack architecture.")
+    print(f"\n  NOTE: KS is a diagnostic only — not an MIA bound.")
+    print(f"        DCR ratio is a geometric indicator of member-neighbourhood memorisation.")
+    print(f"        Values near 1.0 suggest the generator hasn't collapsed onto training points,")
+    print(f"        but do not preclude distributional MIA leakage.")
+    print(f"        LOSO-CV AUC remains the empirical upper bound for your attack architecture.")
     print(f"{'='*65}\n")
 
 

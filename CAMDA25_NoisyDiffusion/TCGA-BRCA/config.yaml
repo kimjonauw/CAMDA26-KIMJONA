@@ -13,7 +13,7 @@ dataset_config:
   split_file: "data/TCGA-BRCA_splits.yaml"
   sample_col_name: "samplesID" 
   subtype_col_name: "cancer_type" 
-  num_splits: 30
+  num_splits: 5
   random_seed: 42
 
 generator_name: "embedded_diffusion"
