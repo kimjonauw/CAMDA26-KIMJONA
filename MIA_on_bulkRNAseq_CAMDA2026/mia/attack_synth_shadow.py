@@ -4,10 +4,9 @@ KEY FIXES:
   1. MLP Checkpointing: Sealed using an internal GroupShuffleSplit ES split.
   2. Optuna StratifiedGroupKFold: Prevents hyperparameter tuning from memorizing 
      subject identities across pooled splits.
-  3. Subject-Disjoint LOSO (Option A): Evaluation uses subjects from the current 
-     test split (non-members) and the previous test split (members). These subjects 
-     are completely stripped from the training pool, ensuring zero identity leakage.
-  4. Group-Aware ES: Plumbs id_train to ensure early stopping is based on generalization.
+  3. Subject-Disjoint LOSO: Training strips eval-zone subjects completely.
+  4. Reference Calibration: Normalizes raw loss trajectories against a pure 
+     non-member baseline to isolate memorization from biological variance.
 """
 
 import os
@@ -27,7 +26,7 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 from . import config
 from .data_utils import (
     load_real_data, load_nd_synthetic, load_challenge_synthetic,
-    get_nd_membership_labels, fit_quantile_scaler,
+    get_nd_membership_labels, fit_quantile_scaler, load_reference_data
 )
 from .shadow_model import (
     train_shadow_model, build_model, build_diffusion_trainer,
@@ -215,6 +214,23 @@ def _extract_clf_hparams(best_params, clf_name):
     return {k: v for k, v in best_params.items() if not k.startswith("use_") and k != "n_noise"}
 
 
+def calibrate_raw_features(raw, raw_ref, n_t, n_noise):
+    """Z-score raw features per timestep using the reference non-member distribution.
+    This effectively subtracts intrinsic biological difficulty and shadow batch effects.
+    """
+    if raw_ref is None or len(raw_ref) == 0:
+        return raw
+    r   = raw.reshape(raw.shape[0], n_t, n_noise)
+    ref = raw_ref.reshape(raw_ref.shape[0], n_t, n_noise)
+    
+    # Compute population mean/std across reference samples AND noise vectors at each t
+    ref_mean = ref.mean(axis=(0, 2)).reshape(1, n_t, 1)
+    ref_std  = ref.std(axis=(0, 2)).reshape(1, n_t, 1)
+    
+    calibrated = (r - ref_mean) / (ref_std + 1e-8)
+    return calibrated.reshape(raw.shape[0], n_t * n_noise)
+
+
 def step_train_shadows(dataset_name, splits=None, device=None):
     splits    = splits or list(range(1, config.NUM_SPLITS + 1))
     device    = device or config.DEVICE
@@ -240,11 +256,23 @@ def step_extract_features(dataset_name, splits=None, device=None):
     sample_ids   = list(X_real_df.index)
     y_int        = np.full(len(X_real_np), config.DUMMY_LABEL, dtype=np.int64)
 
+    # Load reference data (if dataset supports it, e.g. COMBINED)
+    X_ref_df = load_reference_data(dataset_name)
+    X_ref_np = X_ref_df.values.astype(np.float32) if X_ref_df is not None else None
+    y_ref_int = np.full(len(X_ref_np), config.DUMMY_LABEL, dtype=np.int64) if X_ref_np is not None else None
+
     force = _force("features")
     for s in splits:
         out_path = os.path.join(feat_dir, f"features_split_{s}.npz")
+        
+        # If forcing features, we recalculate. Otherwise check if it exists and has the reference data.
         if not force and os.path.exists(out_path):
-            if np.load(out_path)["features"].shape[1] == len(config.T_SUPERSET) * config.N_NOISE: continue
+            try:
+                d = np.load(out_path)
+                if d["features"].shape[1] == len(config.T_SUPERSET) * config.N_NOISE:
+                    if X_ref_np is None or "ref_features" in d:
+                        continue  # Safe to skip
+            except: pass
 
         model = build_model(config.UNCONDITIONAL_NUM_CLASSES, device)
         ckpt  = os.path.join(model_dir, f"shadow_split_{s}.pt")
@@ -255,9 +283,18 @@ def step_extract_features(dataset_name, splits=None, device=None):
 
         X_scaled  = scaler.transform(X_real_np.astype(np.float64)).astype(np.float32)
         features  = extract_loss_features(model, diff_trainer, X_scaled, y_int, t_list=config.T_SUPERSET, n_noise=config.N_NOISE, device=device)
+        
+        ref_features = None
+        if X_ref_np is not None:
+            X_ref_scaled = scaler.transform(X_ref_np.astype(np.float64)).astype(np.float32)
+            ref_features = extract_loss_features(model, diff_trainer, X_ref_scaled, y_ref_int, t_list=config.T_SUPERSET, n_noise=config.N_NOISE, device=device)
+            
         _, y_member = get_nd_membership_labels(dataset_name, s)
 
-        np.savez(out_path, features=features, y_member=y_member, y_label_int=y_int, sample_ids=sample_ids)
+        if ref_features is not None:
+            np.savez(out_path, features=features, y_member=y_member, y_label_int=y_int, sample_ids=sample_ids, ref_features=ref_features)
+        else:
+            np.savez(out_path, features=features, y_member=y_member, y_label_int=y_int, sample_ids=sample_ids)
 
 
 def _subject_disjoint_loso(clf_name, entry, raw_splits, y_splits, id_splits,
@@ -269,26 +306,22 @@ def _subject_disjoint_loso(clf_name, entry, raw_splits, y_splits, id_splits,
     fold_y      = {}
 
     for val_s in eval_indices:
-        # Prev split serves as our "Members" provider (0s in prev split = members in current)
         prev_s = (val_s - 1) % n_splits
         
         nonmember_val_subjects = set(id_splits[val_s][y_splits[val_s] == 0])
         member_val_subjects    = set(id_splits[prev_s][y_splits[prev_s] == 0])
         val_subjects           = nonmember_val_subjects | member_val_subjects
 
-        # Create a pool of features/labels for all splits EXCEPT val_s
-        train_idx   = [i for i in range(n_splits) if i != val_s]
+        train_idx   = [i for i in range(n_splits) if i not in (val_s, prev_s)]
         raw_tr_pool = np.concatenate([raw_splits[i] for i in train_idx])
         y_tr_pool   = np.concatenate([y_splits[i]   for i in train_idx])
         id_tr_pool  = np.concatenate([id_splits[i]  for i in train_idx])
 
-        # Strip ALL evaluation subjects out of the training pool
         train_mask = np.array([sid not in val_subjects for sid in id_tr_pool])
         raw_tr = raw_tr_pool[train_mask]
         y_tr   = y_tr_pool[train_mask]
         id_tr  = id_tr_pool[train_mask]
 
-        # The validation pool is evaluating these subjects exclusively, evaluated via val_s shadow
         val_mask = np.array([sid in val_subjects for sid in id_splits[val_s]])
         raw_vl = raw_splits[val_s][val_mask]
         y_vl   = y_splits[val_s][val_mask]
@@ -330,7 +363,13 @@ def step_train_classifiers(dataset_name, device=None):
     raw_splits, y_splits, id_splits = [], [], []
     for s in range(1, n_splits + 1):
         d = np.load(os.path.join(feat_dir, f"features_split_{s}.npz"))
-        raw_splits.append(d["features"])
+        raw_s = d["features"]
+        
+        # Instantly calibrate raw features using the shadow-specific reference baseline
+        if "ref_features" in d and d["ref_features"] is not None and len(d["ref_features"].shape) > 0:
+            raw_s = calibrate_raw_features(raw_s, d["ref_features"], len(config.T_SUPERSET), config.N_NOISE)
+
+        raw_splits.append(raw_s)
         y_splits.append(d["y_member"])
         id_splits.append(d["sample_ids"])
 
@@ -343,9 +382,20 @@ def step_train_classifiers(dataset_name, device=None):
     opt_indices   = list(range(n_opt_splits))
     eval_indices  = list(range(n_opt_splits, n_splits))
 
-    raw_opt = np.concatenate([raw_splits[i] for i in opt_indices])
-    y_opt   = np.concatenate([y_splits[i]   for i in opt_indices])
-    id_opt  = np.concatenate([id_splits[i]  for i in opt_indices])
+    all_eval_subjects = set()
+    for val_s in eval_indices:
+        prev_s = (val_s - 1) % n_splits
+        all_eval_subjects.update(id_splits[val_s][y_splits[val_s] == 0])
+        all_eval_subjects.update(id_splits[prev_s][y_splits[prev_s] == 0])
+
+    raw_opt_unfiltered = np.concatenate([raw_splits[i] for i in opt_indices])
+    y_opt_unfiltered   = np.concatenate([y_splits[i]   for i in opt_indices])
+    id_opt_unfiltered  = np.concatenate([id_splits[i]  for i in opt_indices])
+
+    opt_mask = np.array([sid not in all_eval_subjects for sid in id_opt_unfiltered])
+    raw_opt = raw_opt_unfiltered[opt_mask]
+    y_opt   = y_opt_unfiltered[opt_mask]
+    id_opt  = id_opt_unfiltered[opt_mask]
 
     results = {}
     for clf_name in config.ACTIVE_CLASSIFIERS:
@@ -410,19 +460,33 @@ def step_evaluate_classifiers(dataset_name, trained_results):
             multi_fpr = tpr_at_fpr_multi(y_member.astype(int), scores)
             summary[clf_name][global_s] = {"tpr": tpr, "auc": auc, "multi_fpr": multi_fpr}
 
-    loso_aucs = {n: float(trained_results[n][5]) for n in trained_results}
-    softmax_w = compute_softmax_weights(loso_aucs, temperature=config.ENSEMBLE_TEMPERATURE, min_auc_gate=config.ENSEMBLE_MIN_AUC_GATE)
+    loso_aucs_overall = {n: float(trained_results[n][5]) for n in trained_results}
+    final_softmax_w = compute_softmax_weights(loso_aucs_overall, temperature=config.ENSEMBLE_TEMPERATURE, min_auc_gate=config.ENSEMBLE_MIN_AUC_GATE)
 
-    for global_s in sorted(split_y.keys()):
-        y_member   = split_y[global_s]
+    for idx, val_s in enumerate(loso_keys_0based):
+        global_s = val_s + 1
+        y_member = split_y[global_s]
+        
+        fold_aucs = {}
+        for clf_name in trained_results:
+            aucs_excluding_current = [
+                trained_results[clf_name][10][i] 
+                for i, s in enumerate(loso_keys_0based) if s != val_s
+            ]
+            fold_aucs[clf_name] = float(np.mean(aucs_excluding_current)) if aucs_excluding_current else 0.5
+            
+        fold_softmax_w = compute_softmax_weights(fold_aucs, temperature=config.ENSEMBLE_TEMPERATURE, min_auc_gate=config.ENSEMBLE_MIN_AUC_GATE)
+
         ens_scores = np.zeros(len(y_member), dtype=np.float64)
-        for clf_name, w in softmax_w.items(): ens_scores += split_scores[global_s][clf_name] * w
+        for clf_name, w in fold_softmax_w.items(): 
+            ens_scores += split_scores[global_s][clf_name] * w
+            
         tpr       = _tpr_at_fpr(y_member.astype(int), ens_scores)
         auc       = roc_auc_score(y_member.astype(int), ens_scores) if len(np.unique(y_member)) > 1 else 0.5
         multi_fpr = tpr_at_fpr_multi(y_member.astype(int), ens_scores)
         summary["ensemble"][global_s] = {"tpr": tpr, "auc": auc, "multi_fpr": multi_fpr}
 
-    return summary, softmax_w
+    return summary, final_softmax_w
 
 
 def step_predict_challenge(dataset_name, trained_results, softmax_w, device=None):
@@ -430,6 +494,10 @@ def step_predict_challenge(dataset_name, trained_results, softmax_w, device=None
     X_real_df, _ = load_real_data(dataset_name)
     X_real_np    = X_real_df.values.astype(np.float32)
     sample_ids   = list(X_real_df.index)
+    
+    # Load reference data
+    X_ref_df = load_reference_data(dataset_name)
+    X_ref_np = X_ref_df.values.astype(np.float32) if X_ref_df is not None else None
 
     proxy_ckpt = os.path.join(config.SHADOW_MODEL_DIR, dataset_name, "target_proxy.pt")
     if not _force("challenge") and os.path.exists(proxy_ckpt):
@@ -442,6 +510,13 @@ def step_predict_challenge(dataset_name, trained_results, softmax_w, device=None
     y_int    = np.full(len(X_real_np), config.DUMMY_LABEL, dtype=np.int64)
     X_scaled = scaler.transform(X_real_np.astype(np.float64)).astype(np.float32)
     raw_challenge = extract_loss_features(model, diff_trainer, X_scaled, y_int, t_list=config.T_SUPERSET, n_noise=config.N_NOISE, device=device)
+
+    # Apply reference calibration to challenge extractions
+    if X_ref_np is not None:
+        y_ref_int = np.full(len(X_ref_np), config.DUMMY_LABEL, dtype=np.int64)
+        X_ref_scaled = scaler.transform(X_ref_np.astype(np.float64)).astype(np.float32)
+        ref_challenge = extract_loss_features(model, diff_trainer, X_ref_scaled, y_ref_int, t_list=config.T_SUPERSET, n_noise=config.N_NOISE, device=device)
+        raw_challenge = calibrate_raw_features(raw_challenge, ref_challenge, len(config.T_SUPERSET), config.N_NOISE)
 
     ds         = config.DATASETS[dataset_name]
     all_scores = {}
