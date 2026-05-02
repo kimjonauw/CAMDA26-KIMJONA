@@ -1,110 +1,72 @@
+# Surgical Feature Engineering: The Geometric Hypothesis
 
-  ---
-  The Attack: A Complete Map of All Pieces
+You are completely right. I fell into the "kitchen sink" trap, confusing more features with better signal. Adding generic statistics like kurtosis and percentiles without a hypothesis just dilutes the tree ensembles, adds highly collinear noise, and obscures the actual mechanism of memorization.
 
-  The Setting
+Here is the revised, strictly hypothesis-driven approach. 
 
-  You're on the Red Team in the CAMDA 2026 Health Privacy Challenge. Someone (the Blue Team / NoisyDiffusion)
-  trained an EmbeddedDiffusion model on some subset of 1,089 real TCGA-BRCA RNA-seq samples and released synthetic
-   data. You don't have access to the target model. Your job: figure out which real samples were in the training
-  set.
+## 1. Pruning the Collinear Noise
+We currently compute `[mean, std, min, max, median, skewness]`.
+- **`mean` and `median`** are nearly perfectly correlated (r > 0.99) across all timesteps because diffusion loss distributions over noise vectors are mostly symmetric. We drop `median`.
+- **`skewness`** is consistently at the bottom of the permutation importance rankings for all models (as seen in `perm_importances_BRCA.csv`). It's dead weight. We drop `skewness`.
+- **`max`** is highly correlated with `mean` and rarely contains isolated signal. We drop `max`.
 
-  The Pieces
+We keep **`mean`**, **`std`** (the most dominant signal in the importance rankings), and **`min`** (absolute best reconstruction).
 
-  Piece: Target real data
-  What it is: 1,089 TCGA-BRCA samples (978 genes)
-  Where it lives: data/CAMDA26/RED_TCGA-BRCA/*.tsv
-  ────────────────────────────────────────
-  Piece: Target synthetic data
-  What it is: Synthetic CSV released by the challenge
-  Where it lives: data/CAMDA26/RED_TCGA-BRCA/synthetic_data_1.csv
-  ────────────────────────────────────────
-  Piece: 5 shadow synthetic datasets
-  What it is: Labeled synth data from NoisyDiffusion (your Blue Team work)
-  Where it lives: CAMDA25_NoisyDiffusion/TCGA-BRCA/synthetic_data/
-  ────────────────────────────────────────
-  Piece: splits.yaml
-  What it is: Ground-truth 5-fold CV: which real samples trained each of the 5 shadow models
-  Where it lives: CAMDA25_NoisyDiffusion/TCGA-BRCA/TCGA-BRCA_splits.yaml
-  ────────────────────────────────────────
-  Piece: Target model
-  What it is: The challenge diffusion model — you don't have it
-  Where it lives: Unknown / black-box
-  ────────────────────────────────────────
-  Piece: EmbeddedDiffusion architecture
-  What it is: The model code (same arch as target)
-  Where it lives: CAMDA25_NoisyDiffusion/TCGA-BRCA/model.py
+## 2. Defining the Geometric Hypotheses
 
-  How Each Piece Is Used, Stage by Stage
+What visual difference defines a memorized trajectory?
 
-  Stage 1: Train Shadow Models (you know the ground truth here)
+### A. The "Aha!" Moment (Steepest Slope)
+**Hypothesis:** A member sample sits exactly on the training manifold. As we walk backward from pure noise, there is a specific timestep $t$ where the model suddenly "recognizes" the sample and perfectly denoises it. This manifests as a sudden, sharp drop in the loss trajectory. Non-members, which sit off the manifold, have a smoother, shallower descent.
+**The Math:** `max_drop = np.min(np.diff(mean_loss_trajectory, axis=1), axis=1)` (The most negative slope between consecutive timesteps).
 
-  Used: splits.yaml + target real data + model architecture
+### B. The Memorization Trough (Timestep of Minimum Loss)
+**Hypothesis:** Because members are perfectly reconstructed, their loss curve hits a deep trough. The exact timestep where this trough occurs ($t_{min}$) is distinct for members compared to non-members (who might never reach a true trough, or reach a shallower one at a different $t$).
+**The Math:** `t_min_idx = np.argmin(mean_loss_trajectory, axis=1)`
 
-  For each of 5 folds in splits.yaml:
-  - Take the train_index (~871 real samples) — these are known members
-  - The test_index (~218 real samples) — these are known non-members
-  - Train an EmbeddedDiffusion model on just the training subset (unconditional, dummy label=0)
-  - You now have 5 shadow models where you know exactly who was in/out
+### C. The Consistency Basin (Variance / Std)
+**Hypothesis:** (This is the one we already partially capture, which explains why `std_T300` is the #1 feature). For a non-member, the model is guessing the denoising path, so different random noise vectors yield highly variable losses. For a member, the model "knows" exactly where to go, so the reconstruction is highly consistent (low variance) regardless of the noise draw.
+**The Math:** `std = np.std(losses_across_noise, axis=2)` (Keep this, it's our strongest existing feature).
 
-  The 5 shadow synthetic datasets and their labels are not used for shadow training (the shadows are trained on
-  real data subsets). The synthetic datasets could be used for label prediction via KNN, but since training is
-  unconditional, this doesn't matter in practice.
+## 3. Surgical Implementation in `loss_features.py`
 
-  Stage 2: Extract Loss-Trajectory Features
+This reduces our feature count per timestep from 6 to 3, dramatically reducing collinearity, and adds exactly two whole-trajectory geometric features.
 
-  Used: 5 shadow models + all 1,089 real samples + splits.yaml (for ground-truth labels)
+```python
+def summarize_features(raw, n_noise, n_t):
+    """Summarize raw (n_samples, n_t * n_noise) using specific geometric hypotheses.
+    
+    Per timestep: mean, std, min (3 stats -> n_t * 3)
+    Whole trajectory: steepest drop, timestep of min loss (2 stats)
+    Total output dim: n_t * 3 + 2
+    """
+    n_samples = raw.shape[0]
+    reshaped  = raw.reshape(n_samples, n_t, n_noise)
 
-  For each shadow model:
-  - Run all 1,089 real samples through it
-  - For each sample, compute denoising loss at 7 timesteps × 300 random noises = 2,100 features
-  - The key signal: samples the shadow was trained on yield lower loss (the model recognizes them); non-members
-  yield higher loss
-  - Tag each sample with its ground-truth membership label from splits.yaml
+    # 1. Pruned Timestep Stats
+    mean = reshaped.mean(axis=2)
+    std  = reshaped.std(axis=2)
+    mn   = reshaped.min(axis=2)
+    
+    # 2. Geometric Trajectory Features
+    # Steepest slope (most negative difference between adjacent timesteps)
+    # Shape: (n_samples, 1)
+    gradients    = np.diff(mean, axis=1)
+    max_drop     = np.min(gradients, axis=1).reshape(-1, 1)
+    
+    # Timestep index of absolute minimum loss
+    # Shape: (n_samples, 1)
+    t_min_idx    = np.argmin(mean, axis=1).reshape(-1, 1)
 
-  Output: 5 feature files, each (1089 × 2100) with binary membership labels.
+    return np.concatenate([mean, std, mn, max_drop, t_min_idx], axis=1)
 
-  Stage 3: Train the Meta-Classifier (MLP)
+def summary_input_dim(n_t):
+    return n_t * 3 + 2
+```
 
-  Used: feature files from stage 2 (splits 1-3 for train, 4-5 for val)
+## Next Steps
+This shrinks the feature space significantly (e.g., for $N_T=15$, from 104 features to exactly 47), removing the highly correlated noise and forcing the trees to split on the actual mechanics of memorization. 
 
-  - Concatenate features from splits 1-3 → ~3,267 labeled examples
-  - Train a 3-layer MLP (2100 → 200 → 200 → 1) to predict member vs. non-member
-  - Best checkpoint selected by TPR @ 10% FPR (the challenge metric)
-  - Result: ~58% TPR at 10% FPR on validation
-
-  Stage 4: Challenge Inference (the actual attack)
-
-  Used: target synthetic data + all 1,089 real samples + trained MLP
-
-  Since you don't have the target model, you build a proxy:
-  1. Train a target proxy EmbeddedDiffusion on the challenge synthetic data (your best guess at what the target
-  model "saw")
-  2. Extract 2,100-dim loss features for all 1,089 real samples using this proxy
-  3. Feed features through the trained MLP → membership probability per sample
-  4. Output: synthetic_data_1_predictions.csv with (sample_id, score)
-
-  The Key Insight (adapted from MIDST)
-
-  The original MIDST approach used two models — one trained on auxiliary data, one on target synthetic data — and
-  compared their loss ratios with a hand-crafted activation function. Your adaptation is more principled: you
-  leverage the NoisyDiffusion splits to get ground-truth membership labels, train shadow models on real data with
-  known membership, and let an MLP learn the membership signal from 2,100-dimensional loss trajectories rather
-  than relying on a heuristic ratio.
-
-
-Other notes:
-
-  During MLP training (inside train_classifier, step 3): validation is computed on concatenated splits 4-5 as one pool (~2,178 samples). It's used epoch-by-epoch to
-  pick the best checkpoint by TPR@10%FPR. This is the standard train/val loop.
-
-  Per-split evaluation (lines 208-219, between steps 3 and 4): takes the already-trained best MLP and evaluates it on each split individually — all 5 of them,
-  including the 3 training splits. Each split's features come from a different shadow model, so the membership labels are different per split. This tells you:
-
-  - Splits 1-3: How well the MLP performs on the data it was trained on (sanity check / overfitting diagnostic)
-  - Splits 4-5: Per-split breakdown of the validation performance (the training loop only reported the pooled val metric — this shows if one split is harder than
-  another)
-
-  So the validation during training is "pooled val loss to pick a checkpoint," while the per-split evaluation is "post-hoc diagnostic showing performance broken down
-   by each shadow model independently." The split-2 result (0.71) vs split-3 (0.50) spread, for example, reveals that some shadow models produce more discriminative
-  features than others.
+If you approve of this hypothesis-driven pruning, I will:
+1. Implement the surgical summary changes in `loss_features.py`.
+2. Implement the **dual-signal concatenation** (calibrated + uncalibrated) from your leak audit, which perfectly complements this by providing the *relative* vs *absolute* versions of these 47 features.

@@ -1,0 +1,29 @@
+That's a solid intuition. Right now the pipeline **replaces** raw with calibrated — it doesn't concatenate both:
+
+```python
+# step_train_classifiers, line 370 — overwrites raw_s
+raw_s = calibrate_raw_features(raw_s, d["ref_features"], ...)
+```
+
+The original uncalibrated signal is thrown away before summarization. You're right that there could be useful information in both:
+
+| Signal | What it captures | What it loses |
+|---|---|---|
+| **Raw summary** (uncalibrated) | Absolute reconstruction difficulty — a member might simply have lower loss | Confounded by tissue type, gene expression magnitude, shadow batch effects |
+| **Calibrated summary** (Z-scored) | Pure relative deviation from non-member baseline — isolates memorization | Absolute scale information — a sample 2σ below ref mean at t=50 looks the same whether the raw loss was 0.3 or 0.8 |
+
+Concatenating both would give classifiers access to **both the absolute and relative signals** and let the tree models (or MLP) decide which matters. The tree ensembles are especially good at this — they'll just ignore whichever features aren't helpful.
+
+Want me to implement this? The change is small — in `step_train_classifiers()`, keep a copy of raw before calibrating and concatenate after summarization:
+
+```python
+raw_uncal = raw_s.copy()                          # keep original
+raw_cal   = calibrate_raw_features(raw_s, ...)    # calibrated
+
+# later, per classifier:
+X_uncal = summarize_features(slice_raw_features(raw_uncal, t_indices, noise_budget), ...)
+X_cal   = summarize_features(slice_raw_features(raw_cal,   t_indices, noise_budget), ...)
+X_feat  = np.concatenate([X_cal, X_uncal], axis=1)  # doubled feature dim
+```
+
+This would double the feature count (e.g. 55 → 110 for MLP, 104 → 208 for full superset trees) — trivial for tree models, and still small for MLP.

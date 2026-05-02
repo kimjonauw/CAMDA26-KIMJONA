@@ -18,7 +18,7 @@ import pandas as pd
 import torch
 import optuna
 from sklearn.model_selection import StratifiedGroupKFold
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, average_precision_score
 
 torch.set_float32_matmul_precision("high")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -302,6 +302,7 @@ def _subject_disjoint_loso(clf_name, entry, raw_splits, y_splits, id_splits,
     n_splits    = len(raw_splits)
     fold_tprs   = []
     fold_aucs   = []
+    fold_auprs  = []
     fold_scores = {}
     fold_y      = {}
 
@@ -333,13 +334,15 @@ def _subject_disjoint_loso(clf_name, entry, raw_splits, y_splits, id_splits,
             clf, _ = entry.train(X_tr, y_tr, id_tr, X_vl, y_vl, f"/tmp/loso_{clf_name}_fold{val_s}", hparams=clf_hparams)
             scores = entry.predict(clf, X_vl)
 
-            tpr = _tpr_at_fpr(y_vl.astype(int), scores)
-            auc = roc_auc_score(y_vl.astype(int), scores)
+            tpr  = _tpr_at_fpr(y_vl.astype(int), scores)
+            auc  = roc_auc_score(y_vl.astype(int), scores)
+            aupr = average_precision_score(y_vl.astype(int), scores)
 
-            print(f"    [Disjoint LOSO S{val_s+1}]  Train rows={len(y_tr)}  Eval rows={len(y_vl)}  TPR@10%={tpr:.4f}  AUC={auc:.4f}")
+            print(f"    [Disjoint LOSO S{val_s+1}]  Train rows={len(y_tr)}  Eval rows={len(y_vl)}  TPR@10%={tpr:.4f}  AUC={auc:.4f}  AUPR={aupr:.4f}")
 
             fold_tprs.append(tpr)
             fold_aucs.append(auc)
+            fold_auprs.append(aupr)
             fold_scores[val_s] = scores
             fold_y[val_s]      = y_vl
 
@@ -347,12 +350,14 @@ def _subject_disjoint_loso(clf_name, entry, raw_splits, y_splits, id_splits,
             print(f"    [LOSO S{val_s+1}] error: {e}")
             fold_tprs.append(0.0)
             fold_aucs.append(0.5)
+            fold_auprs.append(0.0)
             fold_scores[val_s] = np.zeros(len(y_vl))
             fold_y[val_s]      = y_vl
 
-    mean_tpr = float(np.mean(fold_tprs))
-    mean_auc = float(np.mean(fold_aucs))
-    return mean_tpr, mean_auc, fold_tprs, fold_scores, fold_y, fold_aucs
+    mean_tpr  = float(np.mean(fold_tprs))
+    mean_auc  = float(np.mean(fold_aucs))
+    mean_aupr = float(np.mean(fold_auprs))
+    return mean_tpr, mean_auc, mean_aupr, fold_tprs, fold_scores, fold_y, fold_aucs, fold_auprs
 
 
 def step_train_classifiers(dataset_name, device=None):
@@ -415,17 +420,28 @@ def step_train_classifiers(dataset_name, device=None):
         else:
             t_indices, noise_budget, clf_hparams, selected_ts = list(range(len(config.T_SUPERSET))), config.N_NOISE, None, list(config.T_SUPERSET)
 
-        (val_tpr, val_auc, loso_fold_tprs, loso_fold_scores, loso_fold_y, loso_fold_aucs) = _subject_disjoint_loso(
+        (val_tpr, val_auc, val_aupr, loso_fold_tprs, loso_fold_scores, loso_fold_y, loso_fold_aucs, loso_fold_auprs) = _subject_disjoint_loso(
             clf_name, entry, raw_splits, y_splits, id_splits, t_indices, noise_budget, clf_hparams, eval_indices=eval_indices
         )
 
         X_all = summarize_features(slice_raw_features(raw_all, t_indices, noise_budget), noise_budget, len(t_indices))
         clf, _ = entry.train(X_all, y_all, id_all, X_all[:2], y_all[:2], save_dir, hparams=clf_hparams)
 
-        meta = {"t_indices": t_indices, "noise_budget": noise_budget, "clf_hparams": clf_hparams or {}, "selected_ts": selected_ts, "loso_fold_tprs": loso_fold_tprs, "loso_fold_aucs": loso_fold_aucs, "loso_mean_tpr": val_tpr, "loso_mean_auc": val_auc}
+        meta = {
+            "t_indices": t_indices, 
+            "noise_budget": noise_budget, 
+            "clf_hparams": clf_hparams or {}, 
+            "selected_ts": selected_ts, 
+            "loso_fold_tprs": loso_fold_tprs, 
+            "loso_fold_aucs": loso_fold_aucs, 
+            "loso_fold_auprs": loso_fold_auprs, 
+            "loso_mean_tpr": val_tpr, 
+            "loso_mean_auc": val_auc,
+            "loso_mean_aupr": val_aupr
+        }
         with open(os.path.join(save_dir, "signal_params.json"), "w") as f: json.dump(meta, f, indent=2)
 
-        results[clf_name] = (clf, None, t_indices, noise_budget, val_tpr, val_auc, selected_ts, loso_fold_tprs, loso_fold_scores, loso_fold_y, loso_fold_aucs)
+        results[clf_name] = (clf, None, t_indices, noise_budget, val_tpr, val_auc, selected_ts, loso_fold_tprs, loso_fold_scores, loso_fold_y, loso_fold_aucs, val_aupr, loso_fold_auprs)
     return results
 
 
@@ -447,7 +463,7 @@ def step_evaluate_classifiers(dataset_name, trained_results):
         split_y[global_s] = trained_results[ref_clf][9][val_s]
 
     for clf_name, entry_tuple in trained_results.items():
-        (clf, _, t_indices, noise_budget, val_tpr, val_auc, selected_ts, loso_fold_tprs, loso_fold_scores, loso_fold_y, loso_fold_aucs) = entry_tuple
+        (clf, _, t_indices, noise_budget, val_tpr, val_auc, selected_ts, loso_fold_tprs, loso_fold_scores, loso_fold_y, loso_fold_aucs, val_aupr, loso_fold_auprs) = entry_tuple
 
         for idx, val_s in enumerate(loso_keys_0based):
             global_s = val_s + 1
@@ -457,8 +473,9 @@ def step_evaluate_classifiers(dataset_name, trained_results):
 
             tpr       = _tpr_at_fpr(y_member.astype(int), scores)
             auc       = loso_fold_aucs[idx]
+            aupr      = loso_fold_auprs[idx]
             multi_fpr = tpr_at_fpr_multi(y_member.astype(int), scores)
-            summary[clf_name][global_s] = {"tpr": tpr, "auc": auc, "multi_fpr": multi_fpr}
+            summary[clf_name][global_s] = {"tpr": tpr, "auc": auc, "aupr": aupr, "multi_fpr": multi_fpr}
 
     loso_aucs_overall = {n: float(trained_results[n][5]) for n in trained_results}
     final_softmax_w = compute_softmax_weights(loso_aucs_overall, temperature=config.ENSEMBLE_TEMPERATURE, min_auc_gate=config.ENSEMBLE_MIN_AUC_GATE)
@@ -483,8 +500,9 @@ def step_evaluate_classifiers(dataset_name, trained_results):
             
         tpr       = _tpr_at_fpr(y_member.astype(int), ens_scores)
         auc       = roc_auc_score(y_member.astype(int), ens_scores) if len(np.unique(y_member)) > 1 else 0.5
+        aupr      = average_precision_score(y_member.astype(int), ens_scores) if len(np.unique(y_member)) > 1 else 0.0
         multi_fpr = tpr_at_fpr_multi(y_member.astype(int), ens_scores)
-        summary["ensemble"][global_s] = {"tpr": tpr, "auc": auc, "multi_fpr": multi_fpr}
+        summary["ensemble"][global_s] = {"tpr": tpr, "auc": auc, "aupr": aupr, "multi_fpr": multi_fpr}
 
     return summary, final_softmax_w
 
@@ -583,18 +601,20 @@ def generate_report(dataset_name, trained_results, split_summary, ensemble_weigh
         val_auc     = entry_tuple[5]
         selected_ts = entry_tuple[6]
         loso_folds  = entry_tuple[7]
+        val_aupr    = entry_tuple[11]
         splits      = split_summary.get(clf_name, {})
         optuna_tag  = " [fixed]" if clf_name in _NO_OPTUNA_CLASSIFIERS else " [Optuna]"
 
         lines.append(f"\n  ── {clf_name.upper()}{optuna_tag}  (T-subset={selected_ts}) ──")
-        lines.append(f"  {'':8}  {'@1%FPR':>8}  {'@5%FPR':>8}  {'@10%FPR':>9}  {'@20%FPR':>9}  {'AUC':>7}")
+        lines.append(f"  {'':8}  {'@1%FPR':>8}  {'@5%FPR':>8}  {'@10%FPR':>9}  {'@20%FPR':>9}  {'AUC':>7}  {'AUPR':>7}")
         lines.append(
-            f"  {'[LOSO]':<8}  {'':>8}  {'':>8}  {val_tpr:9.4f}  {'':>9}  {val_auc:7.4f}  "
+            f"  {'[LOSO]':<8}  {'':>8}  {'':>8}  {val_tpr:9.4f}  {'':>9}  {val_auc:7.4f}  {val_aupr:7.4f}  "
             f"← LOSO mean (EVAL_ZONE, {len(loso_folds)} folds, per-fold={[f'{t:.3f}' for t in loso_folds]})"
         )
 
         split_tprs_10 = []
         split_aucs    = []
+        split_auprs   = []
         multi_fpr_agg = {t: [] for t in fpr_targets}
 
         _rpt_keys = sorted(splits.keys())
@@ -602,25 +622,30 @@ def generate_report(dataset_name, trained_results, split_summary, ensemble_weigh
             sp   = splits.get(s, {})
             mfp  = sp.get("multi_fpr", {t: 0.0 for t in fpr_targets})
             auc  = sp.get("auc", 0.0)
-            lines.append(f"  [S{s} EVAL]  {mfp.get(0.01, 0.0):8.4f}  {mfp.get(0.05, 0.0):8.4f}  {mfp.get(0.10, 0.0):9.4f}  {mfp.get(0.20, 0.0):9.4f}  {auc:7.4f}")
+            aupr = sp.get("aupr", 0.0)
+            lines.append(f"  [S{s} EVAL]  {mfp.get(0.01, 0.0):8.4f}  {mfp.get(0.05, 0.0):8.4f}  {mfp.get(0.10, 0.0):9.4f}  {mfp.get(0.20, 0.0):9.4f}  {auc:7.4f}  {aupr:7.4f}")
             split_tprs_10.append(mfp.get(0.10, 0.0))
             split_aucs.append(auc)
+            split_auprs.append(aupr)
             for t in fpr_targets: multi_fpr_agg[t].append(mfp.get(t, 0.0))
 
         mean_mfp = {t: float(np.mean(multi_fpr_agg[t])) if len(multi_fpr_agg[t]) else 0.0 for t in fpr_targets}
-        lines.append(f"  {'[MEAN]':<8}  {mean_mfp[0.01]:8.4f}  {mean_mfp[0.05]:8.4f}  {mean_mfp[0.10]:9.4f}  {mean_mfp[0.20]:9.4f}  {float(np.mean(split_aucs)) if split_aucs else 0.0:7.4f}")
+        lines.append(f"  {'[MEAN]':<8}  {mean_mfp[0.01]:8.4f}  {mean_mfp[0.05]:8.4f}  {mean_mfp[0.10]:9.4f}  {mean_mfp[0.20]:9.4f}  {float(np.mean(split_aucs)) if split_aucs else 0.0:7.4f}  {float(np.mean(split_auprs)) if split_auprs else 0.0:7.4f}")
 
         report_data["classifiers"][clf_name] = {
             "val_tpr_10fpr":        round(float(val_tpr), 6),
             "val_auc":              round(float(val_auc), 6),
+            "val_aupr":             round(float(val_aupr), 6),
             "loso_fold_tprs":       [round(float(t), 6) for t in loso_folds],
             "mean_split_tpr_10fpr": round(float(np.mean(split_tprs_10)) if split_tprs_10 else 0.0, 6),
             "mean_split_auc":       round(float(np.mean(split_aucs)) if split_aucs else 0.0, 6),
+            "mean_split_aupr":      round(float(np.mean(split_auprs)) if split_auprs else 0.0, 6),
             "mean_multi_fpr":       {str(t): round(mean_mfp[t], 6) for t in fpr_targets},
             "selected_ts":          [int(t) for t in selected_ts],
             "splits": {
                 str(s): {"multi_fpr": {str(t): round(float(splits.get(s, {}).get("multi_fpr", {}).get(t, 0.0)), 6) for t in fpr_targets},
-                "auc": round(float(splits.get(s, {}).get("auc", 0.0)), 6)}
+                "auc": round(float(splits.get(s, {}).get("auc", 0.0)), 6),
+                "aupr": round(float(splits.get(s, {}).get("aupr", 0.0)), 6)}
                 for s in _rpt_keys
             },
         }
@@ -628,26 +653,30 @@ def generate_report(dataset_name, trained_results, split_summary, ensemble_weigh
     ens_splits   = split_summary.get("ensemble", {})
     ens_tprs_10  = []
     ens_aucs     = []
+    ens_auprs    = []
     ens_mfpr_agg = {t: [] for t in fpr_targets}
 
     lines.append(f"\n  ── ENSEMBLE  (Weighted Blend) ──")
-    lines.append(f"  {'':8}  {'@1%FPR':>8}  {'@5%FPR':>8}  {'@10%FPR':>9}  {'@20%FPR':>9}  {'AUC':>7}")
+    lines.append(f"  {'':8}  {'@1%FPR':>8}  {'@5%FPR':>8}  {'@10%FPR':>9}  {'@20%FPR':>9}  {'AUC':>7}  {'AUPR':>7}")
 
     _ens_rpt_keys = sorted(ens_splits.keys()) if ens_splits else []
     for s in _ens_rpt_keys:
-        sp  = ens_splits.get(s, {})
-        mfp = sp.get("multi_fpr", {t: 0.0 for t in fpr_targets})
-        auc = sp.get("auc", 0.0)
-        lines.append(f"  [S{s} EVAL]  {mfp.get(0.01, 0.0):8.4f}  {mfp.get(0.05, 0.0):8.4f}  {mfp.get(0.10, 0.0):9.4f}  {mfp.get(0.20, 0.0):9.4f}  {auc:7.4f}")
+        sp   = ens_splits.get(s, {})
+        mfp  = sp.get("multi_fpr", {t: 0.0 for t in fpr_targets})
+        auc  = sp.get("auc", 0.0)
+        aupr = sp.get("aupr", 0.0)
+        lines.append(f"  [S{s} EVAL]  {mfp.get(0.01, 0.0):8.4f}  {mfp.get(0.05, 0.0):8.4f}  {mfp.get(0.10, 0.0):9.4f}  {mfp.get(0.20, 0.0):9.4f}  {auc:7.4f}  {aupr:7.4f}")
         ens_tprs_10.append(mfp.get(0.10, 0.0))
         ens_aucs.append(auc)
+        ens_auprs.append(aupr)
         for t in fpr_targets: ens_mfpr_agg[t].append(mfp.get(t, 0.0))
 
     ens_mean_mfp = {t: float(np.mean(ens_mfpr_agg[t])) if len(ens_mfpr_agg[t]) else 0.0 for t in fpr_targets}
-    lines.append(f"  {'[MEAN]':<8}  {ens_mean_mfp[0.01]:8.4f}  {ens_mean_mfp[0.05]:8.4f}  {ens_mean_mfp[0.10]:9.4f}  {ens_mean_mfp[0.20]:9.4f}  {float(np.mean(ens_aucs)) if ens_aucs else 0.0:7.4f}")
+    lines.append(f"  {'[MEAN]':<8}  {ens_mean_mfp[0.01]:8.4f}  {ens_mean_mfp[0.05]:8.4f}  {ens_mean_mfp[0.10]:9.4f}  {ens_mean_mfp[0.20]:9.4f}  {float(np.mean(ens_aucs)) if ens_aucs else 0.0:7.4f}  {float(np.mean(ens_auprs)) if ens_auprs else 0.0:7.4f}")
 
     report_data["ensemble"]["performance"] = {
         "mean_split_auc":       round(float(np.mean(ens_aucs)) if ens_aucs else 0.0, 6),
+        "mean_split_aupr":      round(float(np.mean(ens_auprs)) if ens_auprs else 0.0, 6),
         "mean_multi_fpr":       {str(t): round(ens_mean_mfp[t], 6) for t in fpr_targets},
     }
 
